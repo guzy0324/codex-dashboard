@@ -186,6 +186,15 @@ The dashboard reads the machine name from these sources, in order:
 
 If no machine name is provided, only the original `cwd` path is shown.
 
+## Click To Open VS Code
+
+Click a conversation title or path to open VS Code:
+
+- If `cwd` is a Windows local path, such as `C:\Users\me\project`, the dashboard runs `code <cwd>`.
+- If a machine name is present and `cwd` is not a Windows local path, the dashboard runs `code --remote ssh-remote+<machine> <cwd>`.
+
+Remote opens require the local VS Code Remote-SSH extension and a usable SSH Host alias such as `labgpu`. Set `CODEX_DASHBOARD_CODE_CMD` to override the VS Code CLI path.
+
 ## Completion Alerts
 
 When a real Codex turn finishes, the dashboard:

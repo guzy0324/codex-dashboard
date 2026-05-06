@@ -177,6 +177,15 @@ Dashboard 会按以下顺序读取机器名：
 
 如果没有提供机器名，页面只会显示原始 `cwd` 路径。
 
+## 单击打开 VS Code
+
+会话标题或路径可以单击打开 VS Code：
+
+- `cwd` 是 Windows 本地路径（例如 `C:\Users\me\project`）时，dashboard 执行 `code <cwd>`。
+- 提供了机器名且 `cwd` 不是 Windows 本地路径时，dashboard 执行 `code --remote ssh-remote+<machine> <cwd>`。
+
+远程打开依赖本机 VS Code 已安装 Remote-SSH 扩展，并且 `<machine>` 是本机 SSH 配置中可用的 Host alias，例如 `labgpu`。如果需要覆盖 VS Code CLI 路径，可以设置环境变量 `CODEX_DASHBOARD_CODE_CMD`。
+
 ## 完成提醒
 
 当真实 Codex turn 结束时，dashboard 会：

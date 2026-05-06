@@ -284,6 +284,92 @@ def display_path(machine: str | None, cwd: str | None) -> str:
     return cwd or machine
 
 
+def is_windows_drive_path(path: str) -> bool:
+    return len(path) >= 3 and path[0].isalpha() and path[1] == ":" and path[2] in ("\\", "/")
+
+
+def is_windows_unc_path(path: str) -> bool:
+    return path.startswith("\\\\") or path.startswith("//")
+
+
+def should_open_vscode_remote(machine: str, cwd: str) -> bool:
+    if not machine:
+        return False
+    if is_windows_drive_path(cwd) or is_windows_unc_path(cwd):
+        return False
+    return True
+
+
+def vscode_remote_authority(machine: str) -> str:
+    if machine.startswith("ssh-remote+"):
+        return machine
+    return f"ssh-remote+{machine}"
+
+
+def vscode_command() -> str | None:
+    configured = (os.environ.get("CODEX_DASHBOARD_CODE_CMD") or "").strip()
+    if configured:
+        return configured
+
+    for command in ("code", "Code.exe", "code-insiders", "Code - Insiders.exe"):
+        found = shutil.which(command)
+        if found:
+            return found
+
+    if is_windows():
+        local_app_data = os.environ.get("LOCALAPPDATA") or ""
+        program_files = os.environ.get("ProgramFiles") or ""
+        program_files_x86 = os.environ.get("ProgramFiles(x86)") or ""
+        for candidate in (
+            os.path.join(local_app_data, "Programs", "Microsoft VS Code", "Code.exe"),
+            os.path.join(program_files, "Microsoft VS Code", "Code.exe"),
+            os.path.join(program_files_x86, "Microsoft VS Code", "Code.exe"),
+        ):
+            if candidate and os.path.exists(candidate):
+                return candidate
+
+    return None
+
+
+def open_vscode_path(machine: str | None, cwd: str | None) -> tuple[dict, int]:
+    machine = (machine or "").strip()
+    cwd = (cwd or "").strip()
+
+    if not cwd:
+        return {"ok": False, "error": "missing cwd"}, 400
+    if "\x00" in machine or "\x00" in cwd:
+        return {"ok": False, "error": "invalid path"}, 400
+
+    command = vscode_command()
+    if not command:
+        return {"ok": False, "error": "VS Code CLI was not found in PATH"}, 500
+
+    mode = "remote" if should_open_vscode_remote(machine, cwd) else "local"
+    args = [command]
+    if mode == "remote":
+        args.extend(["--remote", vscode_remote_authority(machine)])
+    args.append(cwd)
+
+    kwargs = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.DEVNULL,
+        "stderr": subprocess.DEVNULL,
+    }
+    if is_windows():
+        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+
+    try:
+        subprocess.Popen(args, **kwargs)
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}, 500
+
+    return {
+        "ok": True,
+        "mode": mode,
+        "target": display_path(machine, cwd),
+    }, 200
+
+
 def permission_summary(payload: dict) -> dict:
     tool_input = payload.get("tool_input")
     if not isinstance(tool_input, dict):
@@ -956,6 +1042,13 @@ def acknowledge_attention():
     return jsonify({"ok": True})
 
 
+@app.post("/api/open_vscode")
+def open_vscode():
+    payload = request.get_json(force=True, silent=True) or {}
+    body, status = open_vscode_path(payload.get("machine"), payload.get("cwd"))
+    return jsonify(body), status
+
+
 @app.get("/api/conversations")
 def conversations():
     refresh_interrupted_turns()
@@ -1104,10 +1197,44 @@ def index():
       color: #fecaca;
       font-weight: 800;
     }
+    .open-target {
+      cursor: pointer;
+      border-bottom: 1px dotted rgba(148,163,184,0.7);
+    }
+    .open-target:hover {
+      color: #f8fafc;
+      border-bottom-color: #f8fafc;
+    }
+    .toast {
+      position: fixed;
+      right: 18px;
+      bottom: 18px;
+      max-width: min(520px, calc(100vw - 36px));
+      background: #020617;
+      color: #e5e7eb;
+      border: 1px solid #334155;
+      border-radius: 12px;
+      padding: 10px 12px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.35);
+      opacity: 0;
+      pointer-events: none;
+      transform: translateY(8px);
+      transition: opacity 0.16s ease, transform 0.16s ease;
+      z-index: 20;
+    }
+    .toast.visible {
+      opacity: 1;
+      transform: translateY(0);
+    }
+    .toast.error {
+      border-color: #ef4444;
+      color: #fecaca;
+    }
   </style>
 </head>
 <body>
   <h1>Codex Dashboard</h1>
+  <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <div id="alerts" class="alerts"></div>
   <div id="list"></div>
 
@@ -1119,6 +1246,7 @@ const ATTENTION_TITLES = {
 };
 let pendingDoneAckId = '';
 let doneAckTimer = null;
+let toastTimer = null;
 
 async function load() {
   const [alertRes, attentionRes, conversationRes] = await Promise.all([
@@ -1148,13 +1276,14 @@ async function load() {
     const answer = item.last_assistant_message || '';
     const sessionCount = item.session_count || 1;
     const statusText = status === 'thinking' ? 'Thinking' : status === 'permission' ? 'Needs Permission' : status === 'interrupted' ? 'Interrupted' : 'Done';
+    const openAttrs = openTargetAttrs(item);
 
     return `
       <div class="card ${status}">
         <div class="row">
           <span class="badge ${status}">${statusText}</span>
-          <span class="mono">${escapeHtml(title)}</span>
-          ${item.title && location ? `<span class="muted mono">${escapeHtml(location)}</span>` : ''}
+          <span class="mono ${openAttrs ? 'open-target' : ''}" ${openAttrs}>${escapeHtml(title)}</span>
+          ${item.title && location ? `<span class="muted mono ${openAttrs ? 'open-target' : ''}" ${openAttrs}>${escapeHtml(location)}</span>` : ''}
         </div>
         <div class="row muted">
           <span>updated: ${escapeHtml(item.updated_at || '')}</span>
@@ -1230,6 +1359,7 @@ async function acknowledgeDone(alertId) {
 function renderAlert(item) {
   const title = item.tool_name || 'permission';
   const command = item.command || item.description || item.tool_input || '';
+  const openAttrs = openTargetAttrs(item);
 
   return `
     <div class="alert">
@@ -1238,12 +1368,59 @@ function renderAlert(item) {
         <span class="alert-title">${escapeHtml(title)}</span>
         <span class="muted">${escapeHtml(item.created_at || '')}</span>
       </div>
-      ${item.display_cwd ? `<div class="muted mono">${escapeHtml(item.display_cwd)}</div>` : ''}
+      ${item.display_cwd ? `<div class="muted mono ${openAttrs ? 'open-target' : ''}" ${openAttrs}>${escapeHtml(item.display_cwd)}</div>` : ''}
       ${item.description ? `<div class="prompt">${escapeHtml(item.description)}</div>` : ''}
       ${command ? `<div class="answer">${escapeHtml(command)}</div>` : ''}
       <div class="muted">session: <span class="mono">${escapeHtml(item.session_id || '')}</span></div>
     </div>
   `;
+}
+
+function openTargetAttrs(item) {
+  const cwd = item.cwd || '';
+  if (!cwd) {
+    return '';
+  }
+  return `data-open-machine="${escapeHtml(item.machine || '')}" data-open-cwd="${escapeHtml(cwd)}" title="Click to open in VS Code"`;
+}
+
+async function openInVscode(machine, cwd) {
+  try {
+    const res = await fetch('/api/open_vscode', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({machine, cwd})
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok || !body.ok) {
+      showToast(body.error || 'Failed to open VS Code', true);
+      return;
+    }
+
+    const prefix = body.mode === 'remote' ? 'Opening SSH target' : 'Opening local path';
+    showToast(`${prefix}: ${body.target || cwd}`);
+  } catch (err) {
+    showToast('Failed to call dashboard open API', true);
+  }
+}
+
+function showToast(message, isError = false) {
+  const toast = document.getElementById('toast');
+  if (!toast) {
+    return;
+  }
+
+  toast.textContent = message;
+  toast.classList.toggle('error', Boolean(isError));
+  toast.classList.add('visible');
+
+  if (toastTimer) {
+    clearTimeout(toastTimer);
+  }
+  toastTimer = setTimeout(() => {
+    toast.classList.remove('visible');
+    toastTimer = null;
+  }, 2600);
 }
 
 function escapeHtml(s) {
@@ -1263,6 +1440,15 @@ document.addEventListener('visibilitychange', () => {
   } else {
     clearDoneAckSchedule();
   }
+});
+
+document.addEventListener('click', event => {
+  const target = event.target.closest('[data-open-cwd]');
+  if (!target) {
+    return;
+  }
+  event.preventDefault();
+  openInVscode(target.dataset.openMachine || '', target.dataset.openCwd || '');
 });
 
 load();
