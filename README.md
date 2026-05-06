@@ -1,0 +1,230 @@
+# Codex Dashboard
+
+Chinese README: [README.zh-CN.md](README.zh-CN.md)
+
+A small local Flask dashboard for OpenAI Codex hooks. It shows active Codex turns,
+marks sessions as thinking/done, plays a local sound when work finishes, and
+highlights permission requests that need user approval.
+
+The dashboard is intentionally in-memory. Restarting the server clears the page.
+
+## Features
+
+- Shows recent Codex conversations from hook events.
+- Groups internal title-generation turns into the real conversation.
+- Hides internal title prompts from the UI.
+- Plays a sound when a real Codex turn finishes.
+- Suppresses sound for internal title-generation turns.
+- Shows permission requests at the top of the page.
+- Flashes the browser tab title and page border while approval is needed.
+- Supports machine-prefixed paths, for example `gpu01:/mdata/project`.
+
+## Requirements
+
+- Python 3.10+
+- Flask
+- pystray and Pillow if you want the Windows notification-area icon
+- `curl` available in the shell running Codex hooks
+
+Install Flask if needed:
+
+```bash
+pip install flask
+```
+
+Install the optional tray dependencies on Windows:
+
+```bash
+pip install pystray pillow
+```
+
+## Run
+
+```bash
+python codex_dashboard.py
+```
+
+Open:
+
+```text
+http://127.0.0.1:18765
+```
+
+On Windows, run with a notification-area icon:
+
+```powershell
+python codex_dashboard.py --serve --tray
+```
+
+If Codex runs in WSL or on a remote host, run this dashboard in the same
+environment that can reach `127.0.0.1:18765` from the hook commands.
+
+## Windows Startup
+
+On Windows, you can register the dashboard to start at logon by placing a
+small launcher in the user's Startup folder. The launcher starts the server in
+the background and shows a Windows notification-area icon near the clock:
+
+```powershell
+python codex_dashboard.py --install-startup
+```
+
+Check whether the launcher exists:
+
+```powershell
+python codex_dashboard.py --startup-status
+```
+
+Remove the startup launcher:
+
+```powershell
+python codex_dashboard.py --uninstall-startup
+```
+
+The launcher starts the dashboard with the current Python interpreter and runs:
+
+```text
+pythonw codex_dashboard.py --serve --tray
+```
+
+The tray menu includes Open Dashboard, Test Bell, Startup, and Exit.
+
+## Codex Hook Config
+
+Add hooks like this to your Codex config. Replace `gpu01` with the machine name
+you want displayed in the dashboard. Use the command variant that matches the
+shell Codex uses to run hooks.
+
+### macOS, Linux, or WSL
+
+```toml
+[features]
+codex_hooks = true
+
+[[hooks.UserPromptSubmit]]
+matcher = "*"
+
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = "curl -fsS --max-time 2 -X POST -H 'Content-Type: application/json' -H 'X-Codex-Machine: gpu01' --data-binary @- http://127.0.0.1:18765/api/codex/user_prompt_submit >/dev/null 2>&1 || true"
+timeout = 3
+statusMessage = "Dashboard: thinking"
+
+[[hooks.PermissionRequest]]
+matcher = "*"
+
+[[hooks.PermissionRequest.hooks]]
+type = "command"
+command = "curl -fsS --max-time 2 -X POST -H 'Content-Type: application/json' -H 'X-Codex-Machine: gpu01' --data-binary @- http://127.0.0.1:18765/api/codex/permission_request >/dev/null 2>&1 || true"
+timeout = 3
+statusMessage = "Dashboard: permission needed"
+
+[[hooks.Stop]]
+matcher = "*"
+
+[[hooks.Stop.hooks]]
+type = "command"
+command = "curl -fsS --max-time 2 -X POST -H 'Content-Type: application/json' -H 'X-Codex-Machine: gpu01' --data-binary @- http://127.0.0.1:18765/api/codex/stop >/dev/null 2>&1 || true; printf '%s\\n' '{\"continue\":true}'"
+timeout = 3
+statusMessage = "Dashboard: done"
+```
+
+For a dynamic machine name in a POSIX shell, use a double-quoted header inside
+the command:
+
+```toml
+command = "curl -fsS --max-time 2 -X POST -H 'Content-Type: application/json' -H \"X-Codex-Machine: ${HOSTNAME:-local}\" --data-binary @- http://127.0.0.1:18765/api/codex/user_prompt_submit >/dev/null 2>&1 || true"
+```
+
+### Windows PowerShell
+
+Use `curl.exe` explicitly on Windows so PowerShell does not resolve `curl` as an
+alias. Replace `gpu01` with the name you want displayed.
+
+```toml
+[features]
+codex_hooks = true
+
+[[hooks.UserPromptSubmit]]
+matcher = "*"
+
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = "curl.exe -fsS --max-time 2 -X POST -H 'Content-Type: application/json' -H 'X-Codex-Machine: gpu01' --data-binary '@-' http://127.0.0.1:18765/api/codex/user_prompt_submit *> $null; exit 0"
+timeout = 3
+statusMessage = "Dashboard: thinking"
+
+[[hooks.PermissionRequest]]
+matcher = "*"
+
+[[hooks.PermissionRequest.hooks]]
+type = "command"
+command = "curl.exe -fsS --max-time 2 -X POST -H 'Content-Type: application/json' -H 'X-Codex-Machine: gpu01' --data-binary '@-' http://127.0.0.1:18765/api/codex/permission_request *> $null; exit 0"
+timeout = 3
+statusMessage = "Dashboard: permission needed"
+
+[[hooks.Stop]]
+matcher = "*"
+
+[[hooks.Stop.hooks]]
+type = "command"
+command = "curl.exe -fsS --max-time 2 -X POST -H 'Content-Type: application/json' -H 'X-Codex-Machine: gpu01' --data-binary '@-' http://127.0.0.1:18765/api/codex/stop *> $null; Write-Output '{\"continue\":true}'; exit 0"
+timeout = 3
+statusMessage = "Dashboard: done"
+```
+
+## Machine Name
+
+The dashboard reads the machine name from these sources, in order:
+
+1. `X-Codex-Machine` header
+2. `X-Machine-Name` header
+3. `?machine=...` query parameter
+4. JSON fields: `machine`, `machine_name`, or `host`
+
+If no machine name is provided, only the original `cwd` path is shown.
+
+## Permission Alerts
+
+When Codex emits `PermissionRequest`, the dashboard:
+
+- plays a local sound,
+- shows a red alert at the top,
+- marks the related conversation as `needs permission`,
+- flashes the browser title between `Codex Dashboard` and `Permission Needed`.
+
+The alert is visual only. It does not approve or deny anything.
+
+## Security Notes
+
+The server binds to `127.0.0.1` and has no authentication. Do not expose it on a
+public interface without adding access control.
+
+Hook payloads can include paths, prompts, commands, and tool input. Treat the
+dashboard as local developer tooling, not as a public service.
+
+## Troubleshooting
+
+Check what owns the port on Windows:
+
+```powershell
+Get-NetTCPConnection -LocalPort 18765 -State Listen |
+  Select-Object LocalAddress,LocalPort,State,OwningProcess
+```
+
+Then inspect the process:
+
+```powershell
+$procId = (Get-NetTCPConnection -LocalPort 18765 -State Listen).OwningProcess
+Get-Process -Id $procId | Select-Object Id,ProcessName,Path,StartTime
+```
+
+On Linux or WSL:
+
+```bash
+ss -ltnp | grep :18765
+```
+
+## License
+
+This project is licensed under the MIT License. See [LICENSE](LICENSE).
