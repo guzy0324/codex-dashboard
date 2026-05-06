@@ -3,7 +3,7 @@
 Chinese README: [README.zh-CN.md](README.zh-CN.md)
 
 A small local Flask dashboard for OpenAI Codex hooks. It shows active Codex turns,
-marks sessions as thinking/done, plays a local sound when work finishes, and
+marks sessions as thinking/done/interrupted, plays a local sound when work finishes, and
 highlights permission requests that need user approval.
 
 The dashboard is intentionally in-memory. Restarting the server clears the page.
@@ -13,6 +13,7 @@ The dashboard is intentionally in-memory. Restarting the server clears the page.
 - Shows recent Codex conversations from hook events.
 - Groups internal title-generation turns into the real conversation.
 - Hides internal title prompts from the UI.
+- Detects manually interrupted turns from transcript events.
 - Plays a sound and flashes a visual reminder when a real Codex turn finishes.
 - Suppresses sound for internal title-generation turns.
 - Shows permission requests at the top of the page.

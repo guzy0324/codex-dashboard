@@ -468,6 +468,8 @@ TITLE_PROMPT_MARKER = (
     "You are a helpful assistant. You will be presented with a user prompt"
 )
 TITLE_ATTACH_WINDOW_SECONDS = 300
+TITLE_FUTURE_TOLERANCE_SECONDS = 5
+TRANSCRIPT_TAIL_BYTES = 1024 * 1024
 
 
 def is_internal_title_prompt(prompt: str | None) -> bool:
@@ -491,6 +493,144 @@ def extract_generated_title(last_msg: str | None) -> str:
         return ""
 
     return safe_short(data.get("title"), 80)
+
+
+def normalized_prompt_text(text: str | None) -> str:
+    return " ".join((text or "").split())
+
+
+def title_prompt_match_score(title_prompt: str | None, prompt: str | None) -> int:
+    title_text = normalized_prompt_text(title_prompt)
+    prompt_text = normalized_prompt_text(prompt)
+    if not title_text or len(prompt_text) < 4:
+        return 0
+
+    if prompt_text in title_text:
+        return len(prompt_text)
+
+    excerpt = prompt_text[:160].strip()
+    if len(excerpt) >= 20 and excerpt in title_text:
+        return len(excerpt)
+
+    first_line = ""
+    if prompt:
+        first_line = normalized_prompt_text(prompt.strip().splitlines()[0])
+    if len(first_line) >= 20 and first_line in title_text:
+        return len(first_line)
+
+    return 0
+
+
+def coerce_event_timestamp(value) -> float | None:
+    if isinstance(value, (int, float)) and value > 0:
+        return float(value)
+
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return None
+
+        try:
+            return float(value)
+        except ValueError:
+            pass
+
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        except ValueError:
+            return None
+
+    return None
+
+
+def read_transcript_tail(transcript_path: str) -> str:
+    if not transcript_path or not os.path.isfile(transcript_path):
+        return ""
+
+    try:
+        size = os.path.getsize(transcript_path)
+        with open(transcript_path, "rb") as f:
+            if size > TRANSCRIPT_TAIL_BYTES:
+                f.seek(-TRANSCRIPT_TAIL_BYTES, os.SEEK_END)
+            data = f.read()
+    except OSError:
+        return ""
+
+    return data.decode("utf-8", errors="replace")
+
+
+def find_turn_aborted_event(transcript_path: str, turn_id: str) -> dict | None:
+    latest = None
+
+    for line in read_transcript_tail(transcript_path).splitlines():
+        try:
+            item = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+
+        if item.get("type") != "event_msg":
+            continue
+
+        payload = item.get("payload")
+        if not isinstance(payload, dict) or payload.get("type") != "turn_aborted":
+            continue
+
+        event_turn_id = payload.get("turn_id") or ""
+        if turn_id and event_turn_id and event_turn_id != turn_id:
+            continue
+
+        completed_at = (
+            coerce_event_timestamp(payload.get("completed_at"))
+            or coerce_event_timestamp(item.get("timestamp"))
+            or now_ts()
+        )
+        latest = {
+            "turn_id": event_turn_id,
+            "reason": payload.get("reason") or "",
+            "completed_at": completed_at,
+        }
+
+    return latest
+
+
+def refresh_interrupted_turns() -> None:
+    with STORE_LOCK:
+        candidates = [
+            (
+                session_id,
+                row.get("current_turn_id") or "",
+                row.get("transcript_path") or "",
+            )
+            for session_id, row in CONVERSATIONS.items()
+            if row.get("status") == "thinking" and row.get("transcript_path")
+        ]
+
+    updates = []
+    for session_id, turn_id, transcript_path in candidates:
+        event = find_turn_aborted_event(transcript_path, turn_id)
+        if event:
+            updates.append((session_id, turn_id, event))
+
+    if not updates:
+        return
+
+    with STORE_LOCK:
+        for session_id, turn_id, event in updates:
+            row = CONVERSATIONS.get(session_id)
+            if not row or row.get("status") != "thinking":
+                continue
+
+            current_turn_id = row.get("current_turn_id") or ""
+            if current_turn_id and turn_id and current_turn_id != turn_id:
+                continue
+
+            completed_at = event.get("completed_at") or now_ts()
+            row.update({
+                "status": "interrupted",
+                "updated_at": max(row.get("updated_at") or 0, completed_at),
+                "finished_at": completed_at,
+            })
+            clear_permission_requests(session_id, turn_id)
 
 
 def conversation_key(item: dict) -> str:
@@ -574,6 +714,7 @@ def attach_title_row(groups: dict[str, dict], item: dict) -> None:
     if not title or not groups:
         return
 
+    scored_candidates = []
     candidates = []
     for group in groups.values():
         if item["machine"] and group["machine"] != item["machine"]:
@@ -582,14 +723,23 @@ def attach_title_row(groups: dict[str, dict], item: dict) -> None:
             continue
         if item["model"] and group["model"] and group["model"] != item["model"]:
             continue
-        delta = abs(group["created_at_raw"] - item["updated_at_raw"])
-        candidates.append((delta, group))
 
-    if not candidates:
-        return
+        group_ts = group["started_at_raw"] or group["created_at_raw"]
+        age = item["updated_at_raw"] - group_ts
+        if age < -TITLE_FUTURE_TOLERANCE_SECONDS or age > TITLE_ATTACH_WINDOW_SECONDS:
+            continue
 
-    delta, group = min(candidates, key=lambda pair: pair[0])
-    if delta > TITLE_ATTACH_WINDOW_SECONDS:
+        score = title_prompt_match_score(item["prompt"], group["prompt"])
+        if score:
+            scored_candidates.append((score, abs(age), group))
+        else:
+            candidates.append((abs(age), group))
+
+    if scored_candidates:
+        _, _, group = min(scored_candidates, key=lambda pair: (-pair[0], pair[1]))
+    elif candidates:
+        _, group = min(candidates, key=lambda pair: pair[0])
+    else:
         return
 
     group["internal_count"] += 1
@@ -808,6 +958,8 @@ def acknowledge_attention():
 
 @app.get("/api/conversations")
 def conversations():
+    refresh_interrupted_turns()
+
     with STORE_LOCK:
         rows = sorted(
             (row.copy() for row in CONVERSATIONS.values()),
@@ -880,6 +1032,9 @@ def index():
     .card.done {
       border-color: #22c55e;
     }
+    .card.interrupted {
+      border-color: #64748b;
+    }
     .row {
       display: flex;
       gap: 10px;
@@ -906,6 +1061,10 @@ def index():
     .badge.done {
       background: rgba(34,197,94,0.15);
       color: #4ade80;
+    }
+    .badge.interrupted {
+      background: rgba(100,116,139,0.22);
+      color: #cbd5e1;
     }
     .mono {
       font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -988,7 +1147,7 @@ async function load() {
     const prompt = item.prompt || '';
     const answer = item.last_assistant_message || '';
     const sessionCount = item.session_count || 1;
-    const statusText = status === 'thinking' ? 'Thinking' : status === 'permission' ? 'Needs Permission' : 'Done';
+    const statusText = status === 'thinking' ? 'Thinking' : status === 'permission' ? 'Needs Permission' : status === 'interrupted' ? 'Interrupted' : 'Done';
 
     return `
       <div class="card ${status}">

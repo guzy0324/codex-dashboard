@@ -2,7 +2,7 @@
 
 英文 README: [README.md](README.md)
 
-Codex Dashboard 是一个面向 OpenAI Codex hooks 的本地 Flask 小面板。它会显示正在运行的 Codex turn，把会话标记为 thinking/done，在任务结束时播放本地提示音，并突出显示需要用户批准的权限请求。
+Codex Dashboard 是一个面向 OpenAI Codex hooks 的本地 Flask 小面板。它会显示正在运行的 Codex turn，把会话标记为 thinking/done/interrupted，在任务结束时播放本地提示音，并突出显示需要用户批准的权限请求。
 
 这个面板只把状态保存在内存里。重启服务后，页面上的历史记录会被清空。
 
@@ -11,6 +11,7 @@ Codex Dashboard 是一个面向 OpenAI Codex hooks 的本地 Flask 小面板。�
 - 显示最近的 Codex hook 事件和会话。
 - 把内部标题生成 turn 归并到真实会话中。
 - 在 UI 中隐藏内部标题提示词。
+- 根据 transcript 事件识别人为中断的 turn。
 - 在真实 Codex turn 结束时播放提示音并显示闪烁式视觉提醒。
 - 对内部标题生成 turn 禁用提示音。
 - 在页面顶部显示权限请求。
