@@ -13,10 +13,11 @@ The dashboard is intentionally in-memory. Restarting the server clears the page.
 - Shows recent Codex conversations from hook events.
 - Groups internal title-generation turns into the real conversation.
 - Hides internal title prompts from the UI.
-- Plays a sound when a real Codex turn finishes.
+- Plays a sound and flashes a visual reminder when a real Codex turn finishes.
 - Suppresses sound for internal title-generation turns.
 - Shows permission requests at the top of the page.
-- Flashes the browser tab title and page border while approval is needed.
+- Flashes the Windows taskbar button for the dashboard browser window when possible.
+- Flashes the Windows tray icon and shows a tray notification popup in tray mode.
 - Supports machine-prefixed paths, for example `gpu01:/mdata/project`.
 
 ## Requirements
@@ -87,7 +88,7 @@ The launcher starts the dashboard with the current Python interpreter and runs:
 pythonw codex_dashboard.py --serve --tray
 ```
 
-The tray menu includes Open Dashboard, Test Bell, Startup, and Exit.
+The tray menu includes Open Dashboard, Test Alert, Startup, and Exit.
 
 ## Codex Hook Config
 
@@ -184,6 +185,18 @@ The dashboard reads the machine name from these sources, in order:
 
 If no machine name is provided, only the original `cwd` path is shown.
 
+## Completion Alerts
+
+When a real Codex turn finishes, the dashboard:
+
+- plays a local sound,
+- marks the dashboard browser window for Windows taskbar attention when possible,
+- flashes the Windows tray icon in tray mode,
+- shows a tray notification popup in tray mode.
+
+The completion visual alert is cleared when the dashboard tab is focused or
+when Open Dashboard is selected from the tray menu.
+
 ## Permission Alerts
 
 When Codex emits `PermissionRequest`, the dashboard:
@@ -191,7 +204,8 @@ When Codex emits `PermissionRequest`, the dashboard:
 - plays a local sound,
 - shows a red alert at the top,
 - marks the related conversation as `needs permission`,
-- flashes the browser title between `Codex Dashboard` and `Permission Needed`.
+- marks the dashboard browser window for Windows taskbar attention when possible,
+- flashes the Windows tray icon and shows a tray notification popup in tray mode.
 
 The alert is visual only. It does not approve or deny anything.
 

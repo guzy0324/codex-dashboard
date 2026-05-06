@@ -11,10 +11,11 @@ Codex Dashboard 是一个面向 OpenAI Codex hooks 的本地 Flask 小面板。�
 - 显示最近的 Codex hook 事件和会话。
 - 把内部标题生成 turn 归并到真实会话中。
 - 在 UI 中隐藏内部标题提示词。
-- 在真实 Codex turn 结束时播放提示音。
+- 在真实 Codex turn 结束时播放提示音并显示闪烁式视觉提醒。
 - 对内部标题生成 turn 禁用提示音。
 - 在页面顶部显示权限请求。
-- 需要批准时闪烁浏览器标签标题和页面边框。
+- 可用时让 dashboard 浏览器窗口的 Windows 任务栏按钮闪烁。
+- 在 tray 模式下，Windows 通知区域图标会闪烁，并显示托盘通知弹窗。
 - 支持带机器名前缀的路径，例如 `gpu01:/mdata/project`。
 
 ## 环境要求
@@ -82,7 +83,7 @@ python codex_dashboard.py --uninstall-startup
 pythonw codex_dashboard.py --serve --tray
 ```
 
-托盘菜单包含 Open Dashboard、Test Bell、Start at Logon 和 Exit。
+托盘菜单包含 Open Dashboard、Test Alert、Start at Logon 和 Exit。
 
 ## Codex Hook 配置
 
@@ -175,6 +176,17 @@ Dashboard 会按以下顺序读取机器名：
 
 如果没有提供机器名，页面只会显示原始 `cwd` 路径。
 
+## 完成提醒
+
+当真实 Codex turn 结束时，dashboard 会：
+
+- 播放本地提示音，
+- 可用时让 dashboard 浏览器窗口的 Windows 任务栏按钮进入提醒闪烁状态，
+- 在 tray 模式下闪烁 Windows 通知区域图标，
+- 在 tray 模式下显示托盘通知弹窗。
+
+完成类视觉提醒会在 dashboard 标签页获得焦点后清除；也可以通过托盘菜单里的 Open Dashboard 清除。
+
 ## 权限提醒
 
 当 Codex 发出 `PermissionRequest` 时，dashboard 会：
@@ -182,7 +194,8 @@ Dashboard 会按以下顺序读取机器名：
 - 播放本地提示音，
 - 在顶部显示红色提醒，
 - 把相关会话标记为 `needs permission`，
-- 让浏览器标题在 `Codex Dashboard` 和 `Permission Needed` 之间闪烁。
+- 可用时让 dashboard 浏览器窗口的 Windows 任务栏按钮进入提醒闪烁状态，
+- 在 tray 模式下闪烁 Windows 通知区域图标，并显示托盘通知弹窗。
 
 这个提醒只负责显示状态，不会批准或拒绝任何请求。
 

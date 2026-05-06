@@ -24,6 +24,7 @@ app = Flask(__name__)
 STORE_LOCK = threading.Lock()
 CONVERSATIONS: dict[str, dict] = {}
 PERMISSION_REQUESTS: list[dict] = []
+DONE_ALERTS: list[dict] = []
 
 
 def now_ts() -> float:
@@ -41,8 +42,8 @@ def play_sound():
 
     try:
         if system == "Windows":
-            import winsound
-            winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
+            # import winsound
+            # winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
             return
 
         if system == "Darwin":
@@ -68,6 +69,91 @@ def play_sound_async():
 
 def is_windows() -> bool:
     return platform.system() == "Windows"
+
+
+TASKBAR_TITLE_MARKERS = (
+    APP_NAME,
+    "Codex Done",
+    "Permission Needed",
+)
+
+
+def set_dashboard_taskbar_flash(stop: bool = False) -> None:
+    if not is_windows():
+        return
+
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        user32 = ctypes.windll.user32
+
+        class FLASHWINFO(ctypes.Structure):
+            _fields_ = [
+                ("cbSize", wintypes.UINT),
+                ("hwnd", wintypes.HWND),
+                ("dwFlags", wintypes.DWORD),
+                ("uCount", wintypes.UINT),
+                ("dwTimeout", wintypes.DWORD),
+            ]
+
+        FLASHW_STOP = 0
+        FLASHW_TRAY = 2
+        FLASHW_TIMERNOFG = 12
+        flags = FLASHW_STOP if stop else (FLASHW_TRAY | FLASHW_TIMERNOFG)
+
+        def flash_window(hwnd) -> None:
+            info = FLASHWINFO(
+                ctypes.sizeof(FLASHWINFO),
+                hwnd,
+                flags,
+                0,
+                0,
+            )
+            user32.FlashWindowEx(ctypes.byref(info))
+
+        def window_title(hwnd) -> str:
+            length = user32.GetWindowTextLengthW(hwnd)
+            if length <= 0:
+                return ""
+            buffer = ctypes.create_unicode_buffer(length + 1)
+            user32.GetWindowTextW(hwnd, buffer, length + 1)
+            return buffer.value
+
+        enum_proc_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+
+        def enum_proc(hwnd, lparam):
+            if not user32.IsWindowVisible(hwnd):
+                return True
+            title = window_title(hwnd)
+            if title and any(marker in title for marker in TASKBAR_TITLE_MARKERS):
+                flash_window(hwnd)
+            return True
+
+        user32.EnumWindows(enum_proc_type(enum_proc), 0)
+    except Exception:
+        pass
+
+
+def flash_dashboard_taskbar_async() -> None:
+    threading.Thread(
+        target=set_dashboard_taskbar_flash,
+        kwargs={"stop": False},
+        daemon=True,
+    ).start()
+
+
+def stop_dashboard_taskbar_flash_async() -> None:
+    threading.Thread(
+        target=set_dashboard_taskbar_flash,
+        kwargs={"stop": True},
+        daemon=True,
+    ).start()
+
+
+def stop_dashboard_taskbar_flash_if_idle_async() -> None:
+    if not current_attention().get("active"):
+        stop_dashboard_taskbar_flash_async()
 
 
 def windows_background_executable() -> str:
@@ -224,6 +310,135 @@ def permission_summary(payload: dict) -> dict:
         "created_at_raw": t,
         "created_at": fmt_ts(t),
     }
+
+
+def done_summary(
+    session_id: str,
+    turn_id: str,
+    machine: str,
+    cwd: str,
+    model: str,
+    transcript_path: str,
+    last_msg: str,
+    created_at: float,
+) -> dict:
+    return {
+        "id": f"done:{session_id}:{turn_id}:{created_at}",
+        "session_id": session_id,
+        "turn_id": turn_id,
+        "machine": machine,
+        "cwd": cwd,
+        "display_cwd": display_path(machine, cwd),
+        "model": model,
+        "transcript_path": transcript_path,
+        "description": safe_short(last_msg, 180),
+        "created_at_raw": created_at,
+        "created_at": fmt_ts(created_at),
+    }
+
+
+def add_done_attention_unlocked(
+    session_id: str,
+    turn_id: str,
+    machine: str,
+    cwd: str,
+    model: str,
+    transcript_path: str,
+    last_msg: str,
+    created_at: float,
+) -> None:
+    DONE_ALERTS.insert(
+        0,
+        done_summary(
+            session_id,
+            turn_id,
+            machine,
+            cwd,
+            model,
+            transcript_path,
+            last_msg,
+            created_at,
+        ),
+    )
+    del DONE_ALERTS[20:]
+
+
+def current_attention_unlocked() -> dict:
+    if PERMISSION_REQUESTS:
+        alert = PERMISSION_REQUESTS[0]
+        return {
+            "active": True,
+            "kind": "permission",
+            "id": alert.get("id") or "",
+            "title": "Permission Needed",
+            "label": "Needs Permission",
+            "count": len(PERMISSION_REQUESTS),
+            "display_cwd": alert.get("display_cwd") or "",
+            "description": (
+                alert.get("description")
+                or alert.get("command")
+                or alert.get("tool_name")
+                or ""
+            ),
+            "created_at": alert.get("created_at") or "",
+            "created_at_raw": alert.get("created_at_raw") or 0,
+        }
+
+    if DONE_ALERTS:
+        alert = DONE_ALERTS[0]
+        return {
+            "active": True,
+            "kind": "done",
+            "id": alert.get("id") or "",
+            "title": "Codex Done",
+            "label": "Done",
+            "count": len(DONE_ALERTS),
+            "display_cwd": alert.get("display_cwd") or "",
+            "description": alert.get("description") or "",
+            "created_at": alert.get("created_at") or "",
+            "created_at_raw": alert.get("created_at_raw") or 0,
+        }
+
+    return {
+        "active": False,
+        "kind": "",
+        "id": "",
+        "title": APP_NAME,
+        "label": "",
+        "count": 0,
+        "display_cwd": "",
+        "description": "",
+        "created_at": "",
+        "created_at_raw": 0,
+    }
+
+
+def current_attention() -> dict:
+    with STORE_LOCK:
+        return current_attention_unlocked()
+
+
+def acknowledge_done_alerts() -> None:
+    with STORE_LOCK:
+        DONE_ALERTS.clear()
+    stop_dashboard_taskbar_flash_if_idle_async()
+
+
+def trigger_test_alert() -> None:
+    t = now_ts()
+    with STORE_LOCK:
+        add_done_attention_unlocked(
+            "test-alert",
+            "",
+            "",
+            "",
+            "",
+            "",
+            "Test alert",
+            t,
+        )
+    play_sound_async()
+    flash_dashboard_taskbar_async()
 
 
 def should_sound_on_stop(row: dict | None, transcript_path: str, last_msg: str) -> bool:
@@ -496,6 +711,17 @@ def stop():
                 })
                 should_sound = should_sound_on_stop(row, transcript_path, last_msg)
                 clear_permission_requests(session_id, turn_id)
+                if should_sound:
+                    add_done_attention_unlocked(
+                        session_id,
+                        turn_id,
+                        machine,
+                        cwd,
+                        model,
+                        transcript_path,
+                        last_msg,
+                        t,
+                    )
         else:
             CONVERSATIONS[session_id] = {
                 "session_id": session_id,
@@ -515,9 +741,23 @@ def stop():
             }
             should_sound = should_sound_on_stop(None, transcript_path, last_msg)
             clear_permission_requests(session_id, turn_id)
+            if should_sound:
+                add_done_attention_unlocked(
+                    session_id,
+                    turn_id,
+                    machine,
+                    cwd,
+                    model,
+                    transcript_path,
+                    last_msg,
+                    t,
+                )
 
     if should_sound:
         play_sound_async()
+        flash_dashboard_taskbar_async()
+    else:
+        stop_dashboard_taskbar_flash_if_idle_async()
 
     return jsonify({"ok": True})
 
@@ -537,12 +777,13 @@ def permission_request():
             CONVERSATIONS[session_id]["updated_at"] = alert["created_at_raw"]
 
     play_sound_async()
+    flash_dashboard_taskbar_async()
     return jsonify({"ok": True})
 
 
 @app.get("/bell")
 def bell():
-    play_sound_async()
+    trigger_test_alert()
     return Response("ok\n", mimetype="text/plain")
 
 
@@ -550,6 +791,19 @@ def bell():
 def permission_requests():
     with STORE_LOCK:
         return jsonify([alert.copy() for alert in PERMISSION_REQUESTS])
+
+
+@app.get("/api/attention")
+def attention():
+    return jsonify(current_attention())
+
+
+@app.post("/api/attention/ack")
+def acknowledge_attention():
+    payload = request.get_json(force=True, silent=True) or {}
+    if (payload.get("kind") or "") == "done":
+        acknowledge_done_alerts()
+    return jsonify({"ok": True})
 
 
 @app.get("/api/conversations")
@@ -606,18 +860,6 @@ def index():
     h1 {
       margin: 0 0 16px;
       font-size: 26px;
-    }
-    body.needs-attention {
-      min-height: 100vh;
-      animation: attentionPulse 1s ease-in-out infinite;
-    }
-    @keyframes attentionPulse {
-      0%, 100% {
-        box-shadow: inset 0 0 0 0 rgba(239,68,68,0);
-      }
-      50% {
-        box-shadow: inset 0 0 0 5px rgba(239,68,68,0.45);
-      }
     }
     .card {
       background: #111827;
@@ -712,22 +954,27 @@ def index():
 
 <script>
 const BASE_TITLE = 'Codex Dashboard';
-const ATTENTION_TITLE = 'Permission Needed';
-let flashTimer = null;
-let lastFlashingAlertId = '';
+const ATTENTION_TITLES = {
+  permission: 'Permission Needed',
+  done: 'Codex Done',
+};
+let pendingDoneAckId = '';
+let doneAckTimer = null;
 
 async function load() {
-  const [alertRes, conversationRes] = await Promise.all([
+  const [alertRes, attentionRes, conversationRes] = await Promise.all([
     fetch('/api/permission_requests'),
+    fetch('/api/attention'),
     fetch('/api/conversations')
   ]);
   const alerts = await alertRes.json();
+  const attention = await attentionRes.json();
   const items = await conversationRes.json();
 
   const alertList = document.getElementById('alerts');
   const list = document.getElementById('list');
   alertList.innerHTML = alerts.map(renderAlert).join('');
-  updateAttention(alerts);
+  updateAttention(attention);
 
   if (!items.length) {
     list.innerHTML = '<div class="muted">No Codex events in this run yet.</div>';
@@ -764,39 +1011,60 @@ async function load() {
   }).join('');
 }
 
-function updateAttention(alerts) {
-  const latestAlertId = alerts.length ? String(alerts[0].id || '') : '';
-  document.body.classList.toggle('needs-attention', Boolean(latestAlertId));
+function updateAttention(attention) {
+  const isActive = Boolean(attention && attention.active && attention.id);
+  const kind = isActive ? String(attention.kind || '') : '';
+  const latestAlertId = isActive ? String(attention.id || '') : '';
+  const attentionTitle = ATTENTION_TITLES[kind] || (attention && attention.title) || 'Codex Attention';
 
-  if (!latestAlertId) {
-    stopTitleFlash();
+  document.title = isActive ? attentionTitle : BASE_TITLE;
+
+  if (!isActive) {
+    clearDoneAckSchedule();
     return;
   }
 
-  if (latestAlertId !== lastFlashingAlertId || !flashTimer) {
-    startTitleFlash(latestAlertId);
+  if (kind === 'done') {
+    scheduleDoneAck(latestAlertId);
+  } else {
+    clearDoneAckSchedule();
   }
 }
 
-function startTitleFlash(alertId) {
-  stopTitleFlash(false);
-  lastFlashingAlertId = alertId;
-  let showAttention = true;
-  document.title = ATTENTION_TITLE;
-  flashTimer = setInterval(() => {
-    document.title = showAttention ? ATTENTION_TITLE : BASE_TITLE;
-    showAttention = !showAttention;
-  }, 800);
+function scheduleDoneAck(alertId) {
+  if (pendingDoneAckId === alertId && doneAckTimer) {
+    return;
+  }
+  clearDoneAckSchedule();
+  if (document.visibilityState !== 'visible' || !document.hasFocus()) {
+    return;
+  }
+
+  pendingDoneAckId = alertId;
+  doneAckTimer = setTimeout(() => acknowledgeDone(alertId), 800);
 }
 
-function stopTitleFlash(resetAlert = true) {
-  if (flashTimer) {
-    clearInterval(flashTimer);
-    flashTimer = null;
+function clearDoneAckSchedule() {
+  if (doneAckTimer) {
+    clearTimeout(doneAckTimer);
+    doneAckTimer = null;
   }
-  document.title = BASE_TITLE;
-  if (resetAlert) {
-    lastFlashingAlertId = '';
+  pendingDoneAckId = '';
+}
+
+async function acknowledgeDone(alertId) {
+  try {
+    await fetch('/api/attention/ack', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({kind: 'done', id: alertId})
+    });
+  } catch (err) {
+  } finally {
+    if (pendingDoneAckId === alertId) {
+      pendingDoneAckId = '';
+      doneAckTimer = null;
+    }
   }
 }
 
@@ -827,6 +1095,16 @@ function escapeHtml(s) {
     .replaceAll('"', '&quot;')
     .replaceAll("'", '&#039;');
 }
+
+window.addEventListener('focus', load);
+window.addEventListener('blur', clearDoneAckSchedule);
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') {
+    load();
+  } else {
+    clearDoneAckSchedule();
+  }
+});
 
 load();
 setInterval(load, 1000);
@@ -864,16 +1142,130 @@ def open_dashboard_now() -> None:
             pass
 
 
-def create_tray_image():
+def create_tray_image(status: str = "idle"):
     from PIL import Image, ImageDraw
 
-    image = Image.new("RGBA", (64, 64), (15, 23, 42, 255))
+    colors = {
+        "idle": ((15, 23, 42), (17, 24, 39)),
+        "done": ((5, 46, 22), (20, 83, 45)),
+        "permission": ((69, 10, 10), (127, 29, 29)),
+    }
+    bg, panel = colors.get(status, colors["idle"])
+
+    image = Image.new("RGBA", (64, 64), (*bg, 255))
     draw = ImageDraw.Draw(image)
-    draw.rounded_rectangle((7, 7, 57, 57), radius=10, fill=(17, 24, 39, 255))
+    draw.rounded_rectangle((7, 7, 57, 57), radius=10, fill=(*panel, 255))
     draw.rectangle((17, 18, 47, 24), fill=(34, 197, 94, 255))
     draw.rectangle((17, 30, 39, 36), fill=(245, 158, 11, 255))
     draw.rectangle((17, 42, 50, 48), fill=(59, 130, 246, 255))
+
+    if status == "permission":
+        draw.ellipse((41, 7, 59, 25), fill=(239, 68, 68, 255))
+        draw.rectangle((49, 11, 51, 18), fill=(254, 242, 242, 255))
+        draw.rectangle((49, 21, 51, 23), fill=(254, 242, 242, 255))
+    elif status == "done":
+        draw.ellipse((41, 7, 59, 25), fill=(34, 197, 94, 255))
+        draw.line((45, 17, 49, 21, 55, 12), fill=(240, 253, 244, 255), width=3)
+
     return image
+
+
+def create_tray_images() -> dict[str, object]:
+    return {
+        "idle": create_tray_image("idle"),
+        "done": create_tray_image("done"),
+        "permission": create_tray_image("permission"),
+    }
+
+
+def tray_attention_title(attention: dict) -> str:
+    if not attention.get("active"):
+        return APP_NAME
+
+    title = attention.get("title") or APP_NAME
+    count = attention.get("count") or 0
+    if count > 1:
+        title = f"{title} ({count})"
+
+    location = safe_short(attention.get("display_cwd"), 42)
+    if location:
+        title = f"{APP_NAME}: {title} - {location}"
+    else:
+        title = f"{APP_NAME}: {title}"
+
+    return safe_short(title, 120)
+
+
+def tray_notification_message(attention: dict) -> str:
+    location = safe_short(attention.get("display_cwd"), 80)
+    description = safe_short(attention.get("description"), 180)
+
+    if location and description:
+        return f"{location}\n{description}"
+    return description or location or attention.get("label") or APP_NAME
+
+
+def notify_tray_attention(icon, attention: dict) -> None:
+    try:
+        icon.notify(
+            tray_notification_message(attention),
+            safe_short(attention.get("title"), 80) or APP_NAME,
+        )
+    except Exception:
+        pass
+
+
+def run_tray_attention_loop(icon, tray_images: dict, stop_event: threading.Event) -> None:
+    blink_on = False
+    last_attention_id = ""
+    last_image_key = ""
+    last_title = ""
+    last_notified_attention_id = ""
+
+    while not stop_event.is_set():
+        attention = current_attention()
+        attention_id = attention.get("id") or ""
+        status = attention.get("kind") if attention.get("active") else "idle"
+        status = status if status in tray_images else "idle"
+
+        if status == "idle":
+            blink_on = False
+            last_attention_id = ""
+            last_notified_attention_id = ""
+        elif attention_id != last_attention_id:
+            blink_on = True
+            last_attention_id = attention_id
+        else:
+            blink_on = not blink_on
+
+        if status != "idle" and attention_id != last_notified_attention_id:
+            notify_tray_attention(icon, attention)
+            last_notified_attention_id = attention_id
+
+        image_key = status if blink_on else "idle"
+        title = tray_attention_title(attention)
+
+        if image_key != last_image_key:
+            try:
+                icon.icon = tray_images[image_key]
+            except Exception:
+                pass
+            last_image_key = image_key
+
+        if title != last_title:
+            try:
+                icon.title = title
+            except Exception:
+                pass
+            last_title = title
+
+        stop_event.wait(0.65)
+
+    try:
+        icon.icon = tray_images["idle"]
+        icon.title = APP_NAME
+    except Exception:
+        pass
 
 
 def run_server_blocking(open_browser: bool) -> int:
@@ -891,7 +1283,8 @@ def run_server_with_tray(open_browser: bool) -> int:
 
     try:
         import pystray
-        tray_image = create_tray_image()
+        tray_images = create_tray_images()
+        tray_image = tray_images["idle"]
     except ImportError:
         print("Missing tray dependencies: install pystray and pillow first.")
         print("Command: pip install pystray pillow")
@@ -912,10 +1305,11 @@ def run_server_with_tray(open_browser: bool) -> int:
     exit_requested = threading.Event()
 
     def on_open(icon, item) -> None:
+        acknowledge_done_alerts()
         open_dashboard_now()
 
     def on_bell(icon, item) -> None:
-        play_sound_async()
+        trigger_test_alert()
 
     def on_toggle_startup(icon, item) -> None:
         try:
@@ -940,16 +1334,27 @@ def run_server_with_tray(open_browser: bool) -> int:
         APP_NAME,
         menu=pystray.Menu(
             pystray.MenuItem("Open Dashboard", on_open, default=True),
-            pystray.MenuItem("Test Bell", on_bell),
+            pystray.MenuItem("Test Alert", on_bell),
             pystray.MenuItem("Start at Logon", on_toggle_startup, checked=startup_checked),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Exit", on_exit),
         ),
     )
 
+    attention_stop = threading.Event()
+    attention_thread = threading.Thread(
+        target=run_tray_attention_loop,
+        args=(icon, tray_images, attention_stop),
+        name="codex-dashboard-tray-attention",
+        daemon=True,
+    )
+    attention_thread.start()
+
     try:
         icon.run()
     finally:
+        attention_stop.set()
+        attention_thread.join(timeout=2)
         server.shutdown()
         if exit_requested.is_set():
             os._exit(0)
