@@ -12,6 +12,7 @@ Codex Dashboard 是一个面向 OpenAI Codex hooks 的本地 Flask 小面板。�
 - 把内部标题生成 turn 归并到真实会话中。
 - 在 UI 中隐藏内部标题提示词。
 - 根据 transcript 事件识别人为中断的 turn。
+- 根据 transcript 中的 `token_count` rate-limit 事件显示 Codex 剩余额度。
 - 在真实 Codex turn 结束时播放提示音并显示闪烁式视觉提醒。
 - 对内部标题生成 turn 禁用提示音。
 - 在页面顶部显示权限请求。

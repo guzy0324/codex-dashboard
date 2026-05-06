@@ -14,6 +14,7 @@ The dashboard is intentionally in-memory. Restarting the server clears the page.
 - Groups internal title-generation turns into the real conversation.
 - Hides internal title prompts from the UI.
 - Detects manually interrupted turns from transcript events.
+- Shows remaining Codex quota from transcript `token_count` rate-limit events.
 - Plays a sound and flashes a visual reminder when a real Codex turn finishes.
 - Suppresses sound for internal title-generation turns.
 - Shows permission requests at the top of the page.

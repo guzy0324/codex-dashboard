@@ -25,6 +25,7 @@ STORE_LOCK = threading.Lock()
 CONVERSATIONS: dict[str, dict] = {}
 PERMISSION_REQUESTS: list[dict] = []
 DONE_ALERTS: list[dict] = []
+TRANSCRIPT_QUOTA_CACHE: dict[str, dict] = {}
 
 
 def now_ts() -> float:
@@ -556,6 +557,7 @@ TITLE_PROMPT_MARKER = (
 TITLE_ATTACH_WINDOW_SECONDS = 300
 TITLE_FUTURE_TOLERANCE_SECONDS = 5
 TRANSCRIPT_TAIL_BYTES = 1024 * 1024
+RATE_LIMIT_WINDOW_KEYS = ("primary", "secondary")
 
 
 def is_internal_title_prompt(prompt: str | None) -> bool:
@@ -609,7 +611,10 @@ def title_prompt_match_score(title_prompt: str | None, prompt: str | None) -> in
 
 def coerce_event_timestamp(value) -> float | None:
     if isinstance(value, (int, float)) and value > 0:
-        return float(value)
+        value = float(value)
+        if value > 10_000_000_000:
+            value = value / 1000
+        return value
 
     if isinstance(value, str):
         value = value.strip()
@@ -617,7 +622,7 @@ def coerce_event_timestamp(value) -> float | None:
             return None
 
         try:
-            return float(value)
+            return coerce_event_timestamp(float(value))
         except ValueError:
             pass
 
@@ -627,6 +632,116 @@ def coerce_event_timestamp(value) -> float | None:
             return None
 
     return None
+
+
+def coerce_float(value) -> float | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return None
+        if value.endswith("%"):
+            value = value[:-1].strip()
+        try:
+            return float(value)
+        except ValueError:
+            return None
+    return None
+
+
+def clamp_percent(value: float) -> float:
+    return max(0.0, min(100.0, value))
+
+
+def rounded_percent(value: float) -> float:
+    return round(clamp_percent(value), 1)
+
+
+def rate_limit_window_label(window_key: str, window_minutes) -> str:
+    minutes_float = coerce_float(window_minutes)
+    if minutes_float and minutes_float > 0:
+        minutes = int(minutes_float)
+        if minutes % 1440 == 0:
+            return f"{minutes // 1440}d"
+        if minutes % 60 == 0:
+            return f"{minutes // 60}h"
+        return f"{minutes}m"
+
+    return window_key
+
+
+def normalize_rate_limit_window(window_key: str, window: dict) -> dict | None:
+    if not isinstance(window, dict):
+        return None
+
+    used_percent = coerce_float(window.get("used_percent"))
+    if used_percent is None:
+        return None
+
+    used_percent = rounded_percent(used_percent)
+    remaining_percent = rounded_percent(100 - used_percent)
+    window_minutes = coerce_float(window.get("window_minutes"))
+    resets_at_raw = coerce_event_timestamp(window.get("resets_at"))
+
+    return {
+        "key": window_key,
+        "label": rate_limit_window_label(window_key, window_minutes),
+        "used_percent": used_percent,
+        "remaining_percent": remaining_percent,
+        "window_minutes": int(window_minutes) if window_minutes else 0,
+        "resets_at_raw": resets_at_raw or 0,
+        "resets_at": fmt_ts(resets_at_raw),
+    }
+
+
+def quota_summary_from_rate_limits(rate_limits: dict | None, event_ts: float | None) -> dict:
+    if not isinstance(rate_limits, dict):
+        return {}
+
+    windows = []
+    handled_keys = set()
+    for key in RATE_LIMIT_WINDOW_KEYS:
+        window = normalize_rate_limit_window(key, rate_limits.get(key))
+        handled_keys.add(key)
+        if window:
+            windows.append(window)
+
+    for key, value in rate_limits.items():
+        if key in handled_keys:
+            continue
+        window = normalize_rate_limit_window(str(key), value)
+        if window:
+            windows.append(window)
+
+    if not windows:
+        return {}
+
+    event_ts = event_ts or now_ts()
+    return {
+        "limit_id": rate_limits.get("limit_id") or "",
+        "limit_name": rate_limits.get("limit_name") or "",
+        "plan_type": rate_limits.get("plan_type") or "",
+        "rate_limit_reached_type": rate_limits.get("rate_limit_reached_type") or "",
+        "windows": windows,
+        "updated_at_raw": event_ts,
+        "updated_at": fmt_ts(event_ts),
+    }
+
+
+def quota_summary_from_payload(payload: dict, event_ts: float | None = None) -> dict:
+    if not isinstance(payload, dict):
+        return {}
+
+    rate_limits = payload.get("rate_limits")
+    if not isinstance(rate_limits, dict):
+        nested_payload = payload.get("payload")
+        if isinstance(nested_payload, dict):
+            rate_limits = nested_payload.get("rate_limits")
+
+    return quota_summary_from_rate_limits(rate_limits, event_ts)
 
 
 def read_transcript_tail(transcript_path: str) -> str:
@@ -643,6 +758,18 @@ def read_transcript_tail(transcript_path: str) -> str:
         return ""
 
     return data.decode("utf-8", errors="replace")
+
+
+def transcript_file_signature(transcript_path: str) -> tuple[int, int] | None:
+    if not transcript_path or not os.path.isfile(transcript_path):
+        return None
+
+    try:
+        stat = os.stat(transcript_path)
+    except OSError:
+        return None
+
+    return (stat.st_mtime_ns, stat.st_size)
 
 
 def find_turn_aborted_event(transcript_path: str, turn_id: str) -> dict | None:
@@ -677,6 +804,90 @@ def find_turn_aborted_event(transcript_path: str, turn_id: str) -> dict | None:
         }
 
     return latest
+
+
+def find_latest_quota_summary(transcript_path: str) -> dict:
+    latest = {}
+
+    for line in read_transcript_tail(transcript_path).splitlines():
+        try:
+            item = json.loads(line)
+        except (TypeError, ValueError):
+            continue
+
+        if item.get("type") != "event_msg":
+            continue
+
+        payload = item.get("payload")
+        if not isinstance(payload, dict):
+            continue
+
+        if payload.get("type") != "token_count" and "rate_limits" not in payload:
+            continue
+
+        event_ts = coerce_event_timestamp(item.get("timestamp")) or now_ts()
+        quota = quota_summary_from_payload(payload, event_ts)
+        if quota:
+            latest = quota
+
+    return latest
+
+
+def cached_latest_quota_summary(transcript_path: str) -> dict:
+    signature = transcript_file_signature(transcript_path)
+    cached = TRANSCRIPT_QUOTA_CACHE.get(transcript_path)
+    if cached and cached.get("signature") == signature:
+        return cached.get("quota") or {}
+
+    if signature is None:
+        return cached.get("quota") if cached else {}
+
+    quota = find_latest_quota_summary(transcript_path)
+    TRANSCRIPT_QUOTA_CACHE[transcript_path] = {
+        "signature": signature,
+        "quota": quota,
+    }
+    return quota
+
+
+def refresh_rate_limits() -> None:
+    with STORE_LOCK:
+        candidates = [
+            (session_id, row.get("transcript_path") or "")
+            for session_id, row in CONVERSATIONS.items()
+            if row.get("transcript_path")
+        ]
+
+    if not candidates:
+        return
+
+    quota_by_path = {}
+    updates = []
+    for session_id, transcript_path in candidates:
+        if transcript_path not in quota_by_path:
+            quota_by_path[transcript_path] = cached_latest_quota_summary(transcript_path)
+
+        quota = quota_by_path[transcript_path]
+        if quota:
+            updates.append((session_id, transcript_path, quota))
+
+    if not updates:
+        return
+
+    with STORE_LOCK:
+        for session_id, transcript_path, quota in updates:
+            row = CONVERSATIONS.get(session_id)
+            if not row or row.get("transcript_path") != transcript_path:
+                continue
+
+            current_quota = row.get("quota")
+            current_updated_at = (
+                current_quota.get("updated_at_raw")
+                if isinstance(current_quota, dict)
+                else 0
+            ) or 0
+            if quota.get("updated_at_raw", 0) >= current_updated_at:
+                row["quota"] = quota
 
 
 def refresh_interrupted_turns() -> None:
@@ -744,6 +955,7 @@ def stored_to_item(row: dict) -> dict:
         "started_at_raw": row.get("started_at") or 0,
         "finished_at_raw": row.get("finished_at") or 0,
         "turn_count": row.get("turn_count") or 0,
+        "quota": row.get("quota") or None,
     }
 
 
@@ -766,6 +978,7 @@ def new_group(key: str, item: dict) -> dict:
         "started_at_raw": item["started_at_raw"],
         "finished_at_raw": item["finished_at_raw"],
         "turn_count": item["turn_count"],
+        "quota": item["quota"],
         "title": "",
         "title_updated_at_raw": 0,
         "internal_count": 0,
@@ -793,6 +1006,17 @@ def merge_item(group: dict, item: dict) -> None:
         group["last_assistant_message"] = item["last_assistant_message"]
         group["transcript_path"] = item["transcript_path"]
         group["updated_at_raw"] = item["updated_at_raw"]
+
+    item_quota = item.get("quota")
+    if isinstance(item_quota, dict):
+        group_quota = group.get("quota")
+        group_quota_updated_at = (
+            group_quota.get("updated_at_raw")
+            if isinstance(group_quota, dict)
+            else 0
+        ) or 0
+        if item_quota.get("updated_at_raw", 0) >= group_quota_updated_at:
+            group["quota"] = item_quota
 
 
 def attach_title_row(groups: dict[str, dict], item: dict) -> None:
@@ -858,6 +1082,7 @@ def finalize_group(group: dict) -> dict:
         "finished_at": fmt_ts(group["finished_at_raw"]),
         "turn_count": group["turn_count"],
         "internal_count": group["internal_count"],
+        "quota": group["quota"],
         "_updated_at_raw": group["updated_at_raw"],
     }
 
@@ -874,11 +1099,12 @@ def user_prompt_submit():
     prompt = payload.get("prompt") or ""
     transcript_path = payload.get("transcript_path") or ""
     t = now_ts()
+    quota = quota_summary_from_payload(payload, t)
 
     with STORE_LOCK:
         row = CONVERSATIONS.get(session_id)
         if row:
-            row.update({
+            updates = {
                 "status": "thinking",
                 "current_turn_id": turn_id,
                 "machine": machine,
@@ -890,7 +1116,10 @@ def user_prompt_submit():
                 "started_at": t,
                 "finished_at": None,
                 "turn_count": row.get("turn_count", 0) + 1,
-            })
+            }
+            if quota:
+                updates["quota"] = quota
+            row.update(updates)
         else:
             CONVERSATIONS[session_id] = {
                 "session_id": session_id,
@@ -907,6 +1136,7 @@ def user_prompt_submit():
                 "started_at": t,
                 "finished_at": None,
                 "turn_count": 1,
+                "quota": quota or None,
             }
 
     return jsonify({"ok": True})
@@ -924,6 +1154,7 @@ def stop():
     last_msg = payload.get("last_assistant_message") or ""
     transcript_path = payload.get("transcript_path") or ""
     t = now_ts()
+    quota = quota_summary_from_payload(payload, t)
 
     should_sound = False
 
@@ -934,7 +1165,7 @@ def stop():
 
             # Prevent Stop from an older turn from overwriting a newer thinking turn.
             if not current_turn_id or not turn_id or current_turn_id == turn_id:
-                row.update({
+                updates = {
                     "status": "done",
                     "current_turn_id": turn_id,
                     "machine": machine,
@@ -944,7 +1175,10 @@ def stop():
                     "transcript_path": transcript_path,
                     "updated_at": t,
                     "finished_at": t,
-                })
+                }
+                if quota:
+                    updates["quota"] = quota
+                row.update(updates)
                 should_sound = should_sound_on_stop(row, transcript_path, last_msg)
                 clear_permission_requests(session_id, turn_id)
                 if should_sound:
@@ -974,6 +1208,7 @@ def stop():
                 "started_at": None,
                 "finished_at": t,
                 "turn_count": 0,
+                "quota": quota or None,
             }
             should_sound = should_sound_on_stop(None, transcript_path, last_msg)
             clear_permission_requests(session_id, turn_id)
@@ -1052,6 +1287,7 @@ def open_vscode():
 @app.get("/api/conversations")
 def conversations():
     refresh_interrupted_turns()
+    refresh_rate_limits()
 
     with STORE_LOCK:
         rows = sorted(
@@ -1168,6 +1404,63 @@ def index():
       color: #94a3b8;
       font-size: 13px;
     }
+    .quota-strip {
+      display: none;
+      align-items: center;
+      flex-wrap: wrap;
+      gap: 12px;
+      background: #020617;
+      border: 1px solid #1f2937;
+      border-radius: 12px;
+      padding: 12px 14px;
+      margin-bottom: 18px;
+    }
+    .quota-strip.visible {
+      display: flex;
+    }
+    .quota-heading {
+      color: #f8fafc;
+      font-weight: 800;
+    }
+    .quota-window {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      min-height: 24px;
+      color: #cbd5e1;
+      font-size: 13px;
+    }
+    .quota-label {
+      color: #94a3b8;
+      font-weight: 700;
+    }
+    .quota-value {
+      color: #f8fafc;
+      font-weight: 800;
+    }
+    .quota-meter {
+      width: 96px;
+      height: 7px;
+      overflow: hidden;
+      border-radius: 999px;
+      background: #334155;
+    }
+    .quota-fill {
+      display: block;
+      height: 100%;
+      border-radius: inherit;
+      background: #22c55e;
+    }
+    .quota-fill.warn {
+      background: #f59e0b;
+    }
+    .quota-fill.danger {
+      background: #ef4444;
+    }
+    .quota-updated {
+      color: #64748b;
+      font-size: 12px;
+    }
     .prompt {
       white-space: pre-wrap;
       color: #f8fafc;
@@ -1235,6 +1528,7 @@ def index():
 <body>
   <h1>Codex Dashboard</h1>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
+  <div id="quota" class="quota-strip"></div>
   <div id="alerts" class="alerts"></div>
   <div id="list"></div>
 
@@ -1262,6 +1556,7 @@ async function load() {
   const list = document.getElementById('list');
   alertList.innerHTML = alerts.map(renderAlert).join('');
   updateAttention(attention);
+  renderQuota(items);
 
   if (!items.length) {
     list.innerHTML = '<div class="muted">No Codex events in this run yet.</div>';
@@ -1277,6 +1572,7 @@ async function load() {
     const sessionCount = item.session_count || 1;
     const statusText = status === 'thinking' ? 'Thinking' : status === 'permission' ? 'Needs Permission' : status === 'interrupted' ? 'Interrupted' : 'Done';
     const openAttrs = openTargetAttrs(item);
+    const quota = quotaSummary(item.quota);
 
     return `
       <div class="card ${status}">
@@ -1289,6 +1585,7 @@ async function load() {
           <span>updated: ${escapeHtml(item.updated_at || '')}</span>
           <span>turns: ${item.turn_count || 0}</span>
           <span>model: ${escapeHtml(item.model || '')}</span>
+          ${quota ? `<span>quota: ${escapeHtml(quota)}</span>` : ''}
           ${sessionCount > 1 ? `<span>sessions: ${sessionCount}</span>` : ''}
         </div>
         <div class="muted">${sessionCount > 1 ? 'latest session' : 'session'}: <span class="mono">${escapeHtml(item.session_id || '')}</span></div>
@@ -1297,6 +1594,81 @@ async function load() {
       </div>
     `;
   }).join('');
+}
+
+function renderQuota(items) {
+  const quotaEl = document.getElementById('quota');
+  if (!quotaEl) {
+    return;
+  }
+
+  const quotaItem = items.find(item => quotaSummary(item.quota));
+  if (!quotaItem) {
+    quotaEl.innerHTML = '';
+    quotaEl.classList.remove('visible');
+    return;
+  }
+
+  const quota = quotaItem.quota || {};
+  const windows = Array.isArray(quota.windows) ? quota.windows : [];
+  const updated = quota.updated_at || '';
+  quotaEl.innerHTML = `
+    <span class="quota-heading">Remaining quota</span>
+    ${windows.map(renderQuotaWindow).join('')}
+    ${updated ? `<span class="quota-updated">updated: ${escapeHtml(updated)}</span>` : ''}
+  `;
+  quotaEl.classList.add('visible');
+}
+
+function renderQuotaWindow(window) {
+  const remaining = clampNumber(Number(window.remaining_percent), 0, 100);
+  const used = clampNumber(Number(window.used_percent), 0, 100);
+  const remainingText = formatPercent(remaining);
+  const usedText = formatPercent(used);
+  const label = window.label || window.key || 'quota';
+  const state = remaining <= 10 ? 'danger' : remaining <= 25 ? 'warn' : '';
+  const titleParts = [
+    `${remainingText}% left`,
+    `${usedText}% used`,
+    window.resets_at ? `resets: ${window.resets_at}` : ''
+  ].filter(Boolean);
+
+  return `
+    <span class="quota-window" title="${escapeHtml(titleParts.join(' / '))}">
+      <span class="quota-label">${escapeHtml(label)}</span>
+      <span class="quota-value">${remainingText}%</span>
+      <span class="quota-meter"><span class="quota-fill ${state}" style="width: ${remaining}%"></span></span>
+    </span>
+  `;
+}
+
+function quotaSummary(quota) {
+  const windows = quota && Array.isArray(quota.windows) ? quota.windows : [];
+  return windows.map(window => {
+    const remaining = formatPercent(window.remaining_percent);
+    if (!remaining) {
+      return '';
+    }
+    const label = window.label || window.key || 'quota';
+    return `${label}: ${remaining}% left`;
+  }).filter(Boolean).join(' / ');
+}
+
+function formatPercent(value) {
+  const num = Number(value);
+  if (!Number.isFinite(num)) {
+    return '';
+  }
+
+  const rounded = Math.round(num * 10) / 10;
+  return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1);
+}
+
+function clampNumber(value, min, max) {
+  if (!Number.isFinite(value)) {
+    return min;
+  }
+  return Math.min(max, Math.max(min, value));
 }
 
 function updateAttention(attention) {
