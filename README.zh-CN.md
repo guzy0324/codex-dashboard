@@ -85,7 +85,7 @@ python codex_dashboard.py --uninstall-startup
 pythonw codex_dashboard.py --serve --tray
 ```
 
-托盘菜单包含 Open Dashboard、Test Alert、Start at Logon 和 Exit。
+托盘悬停提示和右键菜单会显示最近一次已知 Codex 用量。托盘菜单还包含 Open Dashboard、Test Alert、Start at Logon 和 Exit。
 
 ## Codex Hook 配置
 
@@ -196,6 +196,8 @@ Dashboard 会按以下顺序读取机器名：
 - 在 tray 模式下闪烁 Windows 通知区域图标，
 - 在 tray 模式下显示托盘通知弹窗。
 
+托盘悬停提示和右键菜单会在 transcript rate-limit 数据可用时显示最近一次已知 Codex 用量。
+
 点击托盘通知弹窗会在有路径时打开对应工作目录的 VS Code；没有路径时会新开一个 dashboard 页面。完成类视觉提醒会在 dashboard 标签页获得焦点后清除；也可以通过点击托盘通知弹窗或托盘菜单里的 Open Dashboard 清除。
 
 左键点击或双击托盘图标会新开一个 dashboard 页面。
@@ -209,6 +211,8 @@ Dashboard 会按以下顺序读取机器名：
 - 把相关会话标记为 `needs permission`，
 - 可用时让 dashboard 浏览器窗口的 Windows 任务栏按钮进入提醒闪烁状态，
 - 在 tray 模式下闪烁 Windows 通知区域图标，并显示托盘通知弹窗。
+
+托盘悬停提示和右键菜单会在 transcript rate-limit 数据可用时显示最近一次已知 Codex 用量。
 
 点击托盘通知弹窗会在有路径时打开对应工作目录的 VS Code；没有路径时会新开一个 dashboard 页面。
 

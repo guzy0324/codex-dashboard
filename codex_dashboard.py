@@ -564,6 +564,7 @@ TITLE_ATTACH_WINDOW_SECONDS = 300
 TITLE_FUTURE_TOLERANCE_SECONDS = 5
 TRANSCRIPT_TAIL_BYTES = 1024 * 1024
 RATE_LIMIT_WINDOW_KEYS = ("primary", "secondary")
+TRAY_QUOTA_REFRESH_SECONDS = 5.0
 
 
 def is_internal_title_prompt(prompt: str | None) -> bool:
@@ -664,6 +665,15 @@ def clamp_percent(value: float) -> float:
 
 def rounded_percent(value: float) -> float:
     return round(clamp_percent(value), 1)
+
+
+def format_percent_value(value) -> str:
+    num = coerce_float(value)
+    if num is None:
+        return ""
+
+    rounded = rounded_percent(num)
+    return str(int(rounded)) if rounded.is_integer() else f"{rounded:.1f}"
 
 
 def rate_limit_window_label(window_key: str, window_minutes) -> str:
@@ -894,6 +904,48 @@ def refresh_rate_limits() -> None:
             ) or 0
             if quota.get("updated_at_raw", 0) >= current_updated_at:
                 row["quota"] = quota
+
+
+def copy_quota_summary(quota: dict | None) -> dict:
+    if not isinstance(quota, dict):
+        return {}
+
+    copied = {
+        key: value
+        for key, value in quota.items()
+        if key != "windows"
+    }
+    copied["windows"] = [
+        window.copy()
+        for window in quota.get("windows") or []
+        if isinstance(window, dict)
+    ]
+    return copied
+
+
+def latest_quota_summary_unlocked() -> dict:
+    latest = {}
+    latest_updated_at = 0
+
+    for row in CONVERSATIONS.values():
+        quota = row.get("quota")
+        if not isinstance(quota, dict):
+            continue
+
+        updated_at = quota.get("updated_at_raw", 0) or 0
+        if updated_at >= latest_updated_at:
+            latest = quota
+            latest_updated_at = updated_at
+
+    return copy_quota_summary(latest)
+
+
+def latest_quota_for_display(refresh: bool = False) -> dict:
+    if refresh:
+        refresh_rate_limits()
+
+    with STORE_LOCK:
+        return latest_quota_summary_unlocked()
 
 
 def refresh_interrupted_turns() -> None:
@@ -1934,6 +1986,94 @@ def tray_attention_title(attention: dict) -> str:
     return safe_short(title, 120)
 
 
+def quota_window_usage_text(window: dict, include_reset: bool = False) -> str:
+    if not isinstance(window, dict):
+        return ""
+
+    label = str(window.get("label") or window.get("key") or "quota")
+    remaining = format_percent_value(window.get("remaining_percent"))
+    details = []
+
+    if remaining:
+        details.append(f"{remaining}% left")
+    if include_reset and window.get("resets_at"):
+        details.append(f"resets {window['resets_at']}")
+
+    if not details:
+        return ""
+    return f"{label}: {', '.join(details)}"
+
+
+def tray_quota_display_lines(
+    quota: dict,
+    max_windows: int = 4,
+    include_reset: bool = True,
+    include_updated: bool = True,
+    no_quota_text: str = "Usage: no quota yet",
+) -> list[str]:
+    windows = quota.get("windows") if isinstance(quota, dict) else []
+    if not isinstance(windows, list):
+        windows = []
+
+    lines = []
+    for window in windows[:max_windows]:
+        text = quota_window_usage_text(window, include_reset=include_reset)
+        if text:
+            lines.append(f"Usage {text}")
+
+    remaining_count = max(0, len(windows) - max_windows)
+    if remaining_count:
+        lines.append(f"Usage: +{remaining_count} more quota windows")
+
+    updated_at = quota.get("updated_at") if isinstance(quota, dict) else ""
+    if lines and include_updated and updated_at:
+        lines.append(f"Usage updated: {updated_at}")
+
+    return lines or ([no_quota_text] if no_quota_text else [])
+
+
+def truncate_tray_tooltip_lines(lines: list[str], limit: int = 120) -> str:
+    kept = []
+    used = 0
+    for line in lines:
+        original = str(line)
+        text = original
+        separator = 1 if kept else 0
+        remaining = limit - used - separator
+        if remaining <= 0:
+            break
+        if len(text) > remaining:
+            if kept and remaining < 24:
+                break
+            text = text[:remaining] if remaining <= 3 else text[:remaining - 3] + "..."
+        kept.append(text)
+        used += separator + len(text)
+        if len(text) < len(original):
+            break
+
+    return "\n".join(kept) or APP_NAME
+
+
+def tray_hover_title(attention: dict, quota: dict) -> str:
+    quota_lines = tray_quota_display_lines(quota, max_windows=3, no_quota_text="")
+    if not quota_lines:
+        return tray_attention_title(attention)
+
+    lines = [APP_NAME, *quota_lines]
+    if attention.get("active"):
+        title = tray_attention_title(attention)
+        prefix = f"{APP_NAME}: "
+        attention_part = title[len(prefix):] if title.startswith(prefix) else title
+        if attention_part and attention_part != APP_NAME:
+            lines.append(safe_short(attention_part, 60))
+
+    return truncate_tray_tooltip_lines(lines)
+
+
+def tray_quota_menu_lines(quota: dict) -> list[str]:
+    return tray_quota_display_lines(quota)
+
+
 def tray_notification_message(attention: dict) -> str:
     location = safe_short(attention.get("display_cwd"), 80)
     description = safe_short(attention.get("description"), 180)
@@ -1959,8 +2099,18 @@ def run_tray_attention_loop(icon, tray_images: dict, stop_event: threading.Event
     last_image_key = ""
     last_title = ""
     last_notified_attention_id = ""
+    last_quota = {}
+    last_quota_refresh_at = 0.0
 
     while not stop_event.is_set():
+        monotonic_now = time.monotonic()
+        if monotonic_now - last_quota_refresh_at >= TRAY_QUOTA_REFRESH_SECONDS:
+            last_quota_refresh_at = monotonic_now
+            try:
+                last_quota = latest_quota_for_display(refresh=True)
+            except Exception:
+                last_quota = latest_quota_for_display(refresh=False)
+
         attention = current_attention()
         attention_id = attention.get("id") or ""
         status = attention.get("kind") if attention.get("active") else "idle"
@@ -1981,7 +2131,7 @@ def run_tray_attention_loop(icon, tray_images: dict, stop_event: threading.Event
             last_notified_attention_id = attention_id
 
         image_key = status if blink_on else "idle"
-        title = tray_attention_title(attention)
+        title = tray_hover_title(attention, last_quota)
 
         if image_key != last_image_key:
             try:
@@ -2044,6 +2194,7 @@ def run_server_with_tray(open_browser: bool) -> int:
     exit_requested = threading.Event()
     notification_click_event = pystray_win32.WM_USER + 5
     tray_activate_events = {pystray_win32.WM_LBUTTONUP, 0x0203}
+    tray_context_menu_event = getattr(pystray_win32, "WM_RBUTTONUP", 0x0205)
     tray_open_cooldown_seconds = 0.75
 
     class DashboardTrayIcon(pystray.Icon):
@@ -2072,6 +2223,12 @@ def run_server_with_tray(open_browser: bool) -> int:
             if lparam in tray_activate_events:
                 self._handle_tray_activate()
                 return 0
+            if lparam == tray_context_menu_event:
+                try:
+                    latest_quota_for_display(refresh=True)
+                    self.update_menu()
+                except Exception:
+                    pass
             return super()._on_notify(wparam, lparam)
 
     def open_from_tray() -> None:
@@ -2106,19 +2263,29 @@ def run_server_with_tray(open_browser: bool) -> int:
         icon.visible = False
         icon.stop()
 
+    def build_tray_menu():
+        quota_items = tuple(
+            pystray.MenuItem(line, None, enabled=False)
+            for line in tray_quota_menu_lines(latest_quota_for_display(refresh=False))
+        )
+        return (
+            pystray.MenuItem("Open Dashboard", on_open_dashboard, default=True),
+            pystray.Menu.SEPARATOR,
+            *quota_items,
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Test Alert", on_bell),
+            pystray.MenuItem("Start at Logon", on_toggle_startup, checked=startup_checked),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem("Exit", on_exit),
+        )
+
     icon = DashboardTrayIcon(
         APP_NAME,
         tray_image,
         APP_NAME,
         notification_click=on_notification_click,
         tray_activate=on_open_dashboard,
-        menu=pystray.Menu(
-            pystray.MenuItem("Open Dashboard", on_open_dashboard, default=True),
-            pystray.MenuItem("Test Alert", on_bell),
-            pystray.MenuItem("Start at Logon", on_toggle_startup, checked=startup_checked),
-            pystray.Menu.SEPARATOR,
-            pystray.MenuItem("Exit", on_exit),
-        ),
+        menu=pystray.Menu(build_tray_menu),
     )
 
     attention_stop = threading.Event()

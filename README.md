@@ -90,7 +90,8 @@ The launcher starts the dashboard with the current Python interpreter and runs:
 pythonw codex_dashboard.py --serve --tray
 ```
 
-The tray menu includes Open Dashboard, Test Alert, Startup, and Exit.
+The tray tooltip and right-click menu show the latest known Codex usage. The
+tray menu also includes Open Dashboard, Test Alert, Startup, and Exit.
 
 ## Codex Hook Config
 
@@ -205,6 +206,9 @@ When a real Codex turn finishes, the dashboard:
 - flashes the Windows tray icon in tray mode,
 - shows a tray notification popup in tray mode.
 
+The tray tooltip and right-click menu include the latest known Codex usage when
+transcript rate-limit data is available.
+
 Clicking the tray notification popup opens the related working directory in VS
 Code when a path is available, otherwise it opens a new dashboard page. The
 completion visual alert is cleared when the dashboard tab is focused, when the
@@ -222,6 +226,9 @@ When Codex emits `PermissionRequest`, the dashboard:
 - marks the related conversation as `needs permission`,
 - marks the dashboard browser window for Windows taskbar attention when possible,
 - flashes the Windows tray icon and shows a tray notification popup in tray mode.
+
+The tray tooltip and right-click menu include the latest known Codex usage when
+transcript rate-limit data is available.
 
 Clicking the tray notification popup opens the related working directory in VS
 Code when a path is available, otherwise it opens a new dashboard page.
