@@ -18,6 +18,7 @@ HOST = "127.0.0.1"
 PORT = 18765
 DASHBOARD_URL = f"http://{HOST}:{PORT}"
 STARTUP_LAUNCHER_NAME = "CodexDashboard.vbs"
+MAX_ALERTS = 20
 
 app = Flask(__name__)
 
@@ -38,13 +39,15 @@ def fmt_ts(ts: float | None) -> str:
     return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def run_daemon_thread(target, **kwargs) -> None:
+    threading.Thread(target=target, kwargs=kwargs, daemon=True).start()
+
+
 def play_sound():
     system = platform.system()
 
     try:
         if system == "Windows":
-            # import winsound
-            # winsound.MessageBeep(winsound.MB_ICONEXCLAMATION)
             return
 
         if system == "Darwin":
@@ -62,10 +65,6 @@ def play_sound():
                     return
     except Exception:
         pass
-
-
-def play_sound_async():
-    threading.Thread(target=play_sound, daemon=True).start()
 
 
 def is_windows() -> bool:
@@ -136,25 +135,18 @@ def set_dashboard_taskbar_flash(stop: bool = False) -> None:
         pass
 
 
-def flash_dashboard_taskbar_async() -> None:
-    threading.Thread(
-        target=set_dashboard_taskbar_flash,
-        kwargs={"stop": False},
-        daemon=True,
-    ).start()
-
-
 def stop_dashboard_taskbar_flash_async() -> None:
-    threading.Thread(
-        target=set_dashboard_taskbar_flash,
-        kwargs={"stop": True},
-        daemon=True,
-    ).start()
+    run_daemon_thread(set_dashboard_taskbar_flash, stop=True)
 
 
 def stop_dashboard_taskbar_flash_if_idle_async() -> None:
     if not current_attention().get("active"):
         stop_dashboard_taskbar_flash_async()
+
+
+def notify_attention_async() -> None:
+    run_daemon_thread(play_sound)
+    run_daemon_thread(set_dashboard_taskbar_flash, stop=False)
 
 
 def windows_background_executable() -> str:
@@ -182,19 +174,23 @@ def escape_vbs_string(value: str) -> str:
     return value.replace('"', '""')
 
 
+def open_dashboard_url() -> None:
+    try:
+        webbrowser.open(DASHBOARD_URL, new=2, autoraise=True)
+    except Exception:
+        try:
+            if is_windows():
+                os.startfile(DASHBOARD_URL)
+        except Exception:
+            pass
+
+
 def open_dashboard_browser() -> None:
     def _open() -> None:
         time.sleep(2)
-        try:
-            webbrowser.open(DASHBOARD_URL, new=2, autoraise=True)
-        except Exception:
-            try:
-                if is_windows():
-                    os.startfile(DASHBOARD_URL)
-            except Exception:
-                pass
+        open_dashboard_url()
 
-    threading.Thread(target=_open, daemon=True).start()
+    run_daemon_thread(_open)
 
 
 def startup_folder_path() -> str:
@@ -447,62 +443,54 @@ def add_done_attention_unlocked(
             created_at,
         ),
     )
-    del DONE_ALERTS[20:]
+    del DONE_ALERTS[MAX_ALERTS:]
 
 
 def current_attention_unlocked() -> dict:
     if PERMISSION_REQUESTS:
+        alerts = PERMISSION_REQUESTS
         alert = PERMISSION_REQUESTS[0]
-        return {
-            "active": True,
-            "kind": "permission",
-            "id": alert.get("id") or "",
-            "title": "Permission Needed",
-            "label": "Needs Permission",
-            "count": len(PERMISSION_REQUESTS),
-            "machine": alert.get("machine") or "",
-            "cwd": alert.get("cwd") or "",
-            "display_cwd": alert.get("display_cwd") or "",
-            "description": (
-                alert.get("description")
-                or alert.get("command")
-                or alert.get("tool_name")
-                or ""
-            ),
-            "created_at": alert.get("created_at") or "",
-            "created_at_raw": alert.get("created_at_raw") or 0,
-        }
-
-    if DONE_ALERTS:
+        kind, title, label = "permission", "Permission Needed", "Needs Permission"
+        description = (
+            alert.get("description")
+            or alert.get("command")
+            or alert.get("tool_name")
+            or ""
+        )
+    elif DONE_ALERTS:
+        alerts = DONE_ALERTS
         alert = DONE_ALERTS[0]
+        kind, title, label = "done", "Codex Done", "Done"
+        description = alert.get("description") or ""
+    else:
         return {
-            "active": True,
-            "kind": "done",
-            "id": alert.get("id") or "",
-            "title": "Codex Done",
-            "label": "Done",
-            "count": len(DONE_ALERTS),
-            "machine": alert.get("machine") or "",
-            "cwd": alert.get("cwd") or "",
-            "display_cwd": alert.get("display_cwd") or "",
-            "description": alert.get("description") or "",
-            "created_at": alert.get("created_at") or "",
-            "created_at_raw": alert.get("created_at_raw") or 0,
+            "active": False,
+            "kind": "",
+            "id": "",
+            "title": APP_NAME,
+            "label": "",
+            "count": 0,
+            "machine": "",
+            "cwd": "",
+            "display_cwd": "",
+            "description": "",
+            "created_at": "",
+            "created_at_raw": 0,
         }
 
     return {
-        "active": False,
-        "kind": "",
-        "id": "",
-        "title": APP_NAME,
-        "label": "",
-        "count": 0,
-        "machine": "",
-        "cwd": "",
-        "display_cwd": "",
-        "description": "",
-        "created_at": "",
-        "created_at_raw": 0,
+        "active": True,
+        "kind": kind,
+        "id": alert.get("id") or "",
+        "title": title,
+        "label": label,
+        "count": len(alerts),
+        "machine": alert.get("machine") or "",
+        "cwd": alert.get("cwd") or "",
+        "display_cwd": alert.get("display_cwd") or "",
+        "description": description,
+        "created_at": alert.get("created_at") or "",
+        "created_at_raw": alert.get("created_at_raw") or 0,
     }
 
 
@@ -530,8 +518,7 @@ def trigger_test_alert() -> None:
             "Test alert",
             t,
         )
-    play_sound_async()
-    flash_dashboard_taskbar_async()
+    notify_attention_async()
 
 
 def should_sound_on_stop(row: dict | None, transcript_path: str, last_msg: str) -> bool:
@@ -1283,8 +1270,7 @@ def stop():
                 )
 
     if should_sound:
-        play_sound_async()
-        flash_dashboard_taskbar_async()
+        notify_attention_async()
     else:
         stop_dashboard_taskbar_flash_if_idle_async()
 
@@ -1298,15 +1284,14 @@ def permission_request():
 
     with STORE_LOCK:
         PERMISSION_REQUESTS.insert(0, alert)
-        del PERMISSION_REQUESTS[20:]
+        del PERMISSION_REQUESTS[MAX_ALERTS:]
 
         session_id = alert["session_id"]
         if session_id in CONVERSATIONS:
             CONVERSATIONS[session_id]["status"] = "permission"
             CONVERSATIONS[session_id]["updated_at"] = alert["created_at_raw"]
 
-    play_sound_async()
-    flash_dashboard_taskbar_async()
+    notify_attention_async()
     return jsonify({"ok": True})
 
 
@@ -1906,17 +1891,6 @@ class DashboardServer:
         self._thread.join(timeout=5)
 
 
-def open_dashboard_now() -> None:
-    try:
-        webbrowser.open(DASHBOARD_URL, new=2, autoraise=True)
-    except Exception:
-        try:
-            if is_windows():
-                os.startfile(DASHBOARD_URL)
-        except Exception:
-            pass
-
-
 def open_current_attention_in_vscode() -> bool:
     attention = current_attention()
     if not attention.get("active") or not attention.get("cwd"):
@@ -2068,10 +2042,6 @@ def tray_hover_title(attention: dict, quota: dict) -> str:
             lines.append(safe_short(attention_part, 60))
 
     return truncate_tray_tooltip_lines(lines)
-
-
-def tray_quota_menu_lines(quota: dict) -> list[str]:
-    return tray_quota_display_lines(quota)
 
 
 def tray_notification_message(attention: dict) -> str:
@@ -2233,7 +2203,7 @@ def run_server_with_tray(open_browser: bool) -> int:
 
     def open_from_tray() -> None:
         acknowledge_done_alerts()
-        open_dashboard_now()
+        open_dashboard_url()
 
     def on_open_dashboard(icon, item=None) -> None:
         open_from_tray()
@@ -2266,7 +2236,7 @@ def run_server_with_tray(open_browser: bool) -> int:
     def build_tray_menu():
         quota_items = tuple(
             pystray.MenuItem(line, None, enabled=False)
-            for line in tray_quota_menu_lines(latest_quota_for_display(refresh=False))
+            for line in tray_quota_display_lines(latest_quota_for_display(refresh=False))
         )
         return (
             pystray.MenuItem("Open Dashboard", on_open_dashboard, default=True),
