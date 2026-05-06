@@ -205,8 +205,13 @@ When a real Codex turn finishes, the dashboard:
 - flashes the Windows tray icon in tray mode,
 - shows a tray notification popup in tray mode.
 
-The completion visual alert is cleared when the dashboard tab is focused or
-when Open Dashboard is selected from the tray menu.
+Clicking the tray notification popup opens the related working directory in VS
+Code when a path is available, otherwise it opens a new dashboard page. The
+completion visual alert is cleared when the dashboard tab is focused, when the
+tray notification is clicked, or when Open Dashboard is selected from the tray
+menu.
+
+Left-clicking or double-clicking the tray icon opens a new dashboard page.
 
 ## Permission Alerts
 
@@ -217,6 +222,11 @@ When Codex emits `PermissionRequest`, the dashboard:
 - marks the related conversation as `needs permission`,
 - marks the dashboard browser window for Windows taskbar attention when possible,
 - flashes the Windows tray icon and shows a tray notification popup in tray mode.
+
+Clicking the tray notification popup opens the related working directory in VS
+Code when a path is available, otherwise it opens a new dashboard page.
+
+Left-clicking or double-clicking the tray icon opens a new dashboard page.
 
 The alert is visual only. It does not approve or deny anything.
 

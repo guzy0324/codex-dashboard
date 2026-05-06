@@ -186,7 +186,7 @@ def open_dashboard_browser() -> None:
     def _open() -> None:
         time.sleep(2)
         try:
-            webbrowser.open(DASHBOARD_URL, new=1, autoraise=True)
+            webbrowser.open(DASHBOARD_URL, new=2, autoraise=True)
         except Exception:
             try:
                 if is_windows():
@@ -460,6 +460,8 @@ def current_attention_unlocked() -> dict:
             "title": "Permission Needed",
             "label": "Needs Permission",
             "count": len(PERMISSION_REQUESTS),
+            "machine": alert.get("machine") or "",
+            "cwd": alert.get("cwd") or "",
             "display_cwd": alert.get("display_cwd") or "",
             "description": (
                 alert.get("description")
@@ -480,6 +482,8 @@ def current_attention_unlocked() -> dict:
             "title": "Codex Done",
             "label": "Done",
             "count": len(DONE_ALERTS),
+            "machine": alert.get("machine") or "",
+            "cwd": alert.get("cwd") or "",
             "display_cwd": alert.get("display_cwd") or "",
             "description": alert.get("description") or "",
             "created_at": alert.get("created_at") or "",
@@ -493,6 +497,8 @@ def current_attention_unlocked() -> dict:
         "title": APP_NAME,
         "label": "",
         "count": 0,
+        "machine": "",
+        "cwd": "",
         "display_cwd": "",
         "description": "",
         "created_at": "",
@@ -1850,13 +1856,28 @@ class DashboardServer:
 
 def open_dashboard_now() -> None:
     try:
-        webbrowser.open(DASHBOARD_URL, new=1, autoraise=True)
+        webbrowser.open(DASHBOARD_URL, new=2, autoraise=True)
     except Exception:
         try:
             if is_windows():
                 os.startfile(DASHBOARD_URL)
         except Exception:
             pass
+
+
+def open_current_attention_in_vscode() -> bool:
+    attention = current_attention()
+    if not attention.get("active") or not attention.get("cwd"):
+        return False
+
+    body, status = open_vscode_path(attention.get("machine"), attention.get("cwd"))
+    if status >= 400 or not body.get("ok"):
+        return False
+
+    if attention.get("kind") == "done":
+        acknowledge_done_alerts()
+
+    return True
 
 
 def create_tray_image(status: str = "idle"):
@@ -2000,6 +2021,7 @@ def run_server_with_tray(open_browser: bool) -> int:
 
     try:
         import pystray
+        from pystray._util import win32 as pystray_win32
         tray_images = create_tray_images()
         tray_image = tray_images["idle"]
     except ImportError:
@@ -2020,10 +2042,49 @@ def run_server_with_tray(open_browser: bool) -> int:
         open_dashboard_browser()
 
     exit_requested = threading.Event()
+    notification_click_event = pystray_win32.WM_USER + 5
+    tray_activate_events = {pystray_win32.WM_LBUTTONUP, 0x0203}
+    tray_open_cooldown_seconds = 0.75
 
-    def on_open(icon, item) -> None:
+    class DashboardTrayIcon(pystray.Icon):
+        def __init__(self, *args, notification_click=None, tray_activate=None, **kwargs):
+            self._notification_click = notification_click
+            self._tray_activate = tray_activate
+            self._last_tray_open_at = 0.0
+            super().__init__(*args, **kwargs)
+
+        def _handle_callback(self, callback) -> None:
+            if callback:
+                callback(self)
+                self.update_menu()
+
+        def _handle_tray_activate(self) -> None:
+            opened_at = time.monotonic()
+            if opened_at - self._last_tray_open_at <= tray_open_cooldown_seconds:
+                return
+            self._last_tray_open_at = opened_at
+            self._handle_callback(self._tray_activate)
+
+        def _on_notify(self, wparam, lparam):
+            if lparam == notification_click_event:
+                self._handle_callback(self._notification_click)
+                return 0
+            if lparam in tray_activate_events:
+                self._handle_tray_activate()
+                return 0
+            return super()._on_notify(wparam, lparam)
+
+    def open_from_tray() -> None:
         acknowledge_done_alerts()
         open_dashboard_now()
+
+    def on_open_dashboard(icon, item=None) -> None:
+        open_from_tray()
+
+    def on_notification_click(icon) -> None:
+        if open_current_attention_in_vscode():
+            return
+        open_from_tray()
 
     def on_bell(icon, item) -> None:
         trigger_test_alert()
@@ -2045,12 +2106,14 @@ def run_server_with_tray(open_browser: bool) -> int:
         icon.visible = False
         icon.stop()
 
-    icon = pystray.Icon(
+    icon = DashboardTrayIcon(
         APP_NAME,
         tray_image,
         APP_NAME,
+        notification_click=on_notification_click,
+        tray_activate=on_open_dashboard,
         menu=pystray.Menu(
-            pystray.MenuItem("Open Dashboard", on_open, default=True),
+            pystray.MenuItem("Open Dashboard", on_open_dashboard, default=True),
             pystray.MenuItem("Test Alert", on_bell),
             pystray.MenuItem("Start at Logon", on_toggle_startup, checked=startup_checked),
             pystray.Menu.SEPARATOR,
