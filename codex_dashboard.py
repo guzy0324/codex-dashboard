@@ -19,6 +19,7 @@ PORT = 18765
 DASHBOARD_URL = f"http://{HOST}:{PORT}"
 STARTUP_LAUNCHER_NAME = "CodexDashboard.vbs"
 MAX_ALERTS = 20
+VSCODE_CODEX_SIDEBAR_COMMAND = "chatgpt.openSidebar"
 
 app = Flask(__name__)
 
@@ -346,6 +347,7 @@ def open_vscode_path(machine: str | None, cwd: str | None) -> tuple[dict, int]:
     if mode == "remote":
         args.extend(["--remote", vscode_remote_authority(machine)])
     args.append(cwd)
+    args.extend(["--command", VSCODE_CODEX_SIDEBAR_COMMAND])
 
     kwargs = {
         "stdin": subprocess.DEVNULL,
@@ -364,6 +366,7 @@ def open_vscode_path(machine: str | None, cwd: str | None) -> tuple[dict, int]:
         "ok": True,
         "mode": mode,
         "target": display_path(machine, cwd),
+        "open_command": VSCODE_CODEX_SIDEBAR_COMMAND,
     }, 200
 
 
@@ -1796,7 +1799,7 @@ function openTargetAttrs(item) {
   if (!cwd) {
     return '';
   }
-  return `data-open-machine="${escapeHtml(item.machine || '')}" data-open-cwd="${escapeHtml(cwd)}" title="Click to open in VS Code"`;
+  return `data-open-machine="${escapeHtml(item.machine || '')}" data-open-cwd="${escapeHtml(cwd)}" title="Click to open in VS Code and Codex Sidebar"`;
 }
 
 async function openInVscode(machine, cwd) {
@@ -1813,7 +1816,8 @@ async function openInVscode(machine, cwd) {
     }
 
     const prefix = body.mode === 'remote' ? 'Opening SSH target' : 'Opening local path';
-    showToast(`${prefix}: ${body.target || cwd}`);
+    const suffix = body.open_command ? ' and Codex sidebar' : '';
+    showToast(`${prefix}${suffix}: ${body.target || cwd}`);
   } catch (err) {
     showToast('Failed to call dashboard open API', true);
   }

@@ -188,12 +188,12 @@ The dashboard reads the machine name from these sources, in order:
 
 If no machine name is provided, only the original `cwd` path is shown.
 
-## Click To Open VS Code
+## Click To Open VS Code And Codex Sidebar
 
-Click a conversation title or path to open VS Code:
+Click a conversation title or path to open VS Code and focus the Codex sidebar:
 
-- If `cwd` is a Windows local path, such as `C:\Users\me\project`, the dashboard runs `code <cwd>`.
-- If a machine name is present and `cwd` is not a Windows local path, the dashboard runs `code --remote ssh-remote+<machine> <cwd>`.
+- If `cwd` is a Windows local path, such as `C:\Users\me\project`, the dashboard runs `code <cwd> --command chatgpt.openSidebar`.
+- If a machine name is present and `cwd` is not a Windows local path, the dashboard runs `code --remote ssh-remote+<machine> <cwd> --command chatgpt.openSidebar`.
 
 Remote opens require the local VS Code Remote-SSH extension and a usable SSH Host alias such as `labgpu`. Set `CODEX_DASHBOARD_CODE_CMD` to override the VS Code CLI path.
 
@@ -210,10 +210,10 @@ The tray tooltip and right-click menu include the latest known Codex usage when
 transcript rate-limit data is available.
 
 Clicking the tray notification popup opens the related working directory in VS
-Code when a path is available, otherwise it opens a new dashboard page. The
-completion visual alert is cleared when the dashboard tab is focused, when the
-tray notification is clicked, or when Open Dashboard is selected from the tray
-menu.
+Code and focuses the Codex sidebar when a path is available, otherwise it opens
+a new dashboard page. The completion visual alert is cleared when the dashboard
+tab is focused, when the tray notification is clicked, or when Open Dashboard is
+selected from the tray menu.
 
 Left-clicking or double-clicking the tray icon opens a new dashboard page.
 
@@ -231,7 +231,8 @@ The tray tooltip and right-click menu include the latest known Codex usage when
 transcript rate-limit data is available.
 
 Clicking the tray notification popup opens the related working directory in VS
-Code when a path is available, otherwise it opens a new dashboard page.
+Code and focuses the Codex sidebar when a path is available, otherwise it opens
+a new dashboard page.
 
 Left-clicking or double-clicking the tray icon opens a new dashboard page.
 

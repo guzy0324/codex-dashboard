@@ -178,12 +178,12 @@ Dashboard 会按以下顺序读取机器名：
 
 如果没有提供机器名，页面只会显示原始 `cwd` 路径。
 
-## 单击打开 VS Code
+## 单击打开 VS Code 和 Codex 侧边栏
 
-会话标题或路径可以单击打开 VS Code：
+会话标题或路径可以单击打开 VS Code 并聚焦 Codex 侧边栏：
 
-- `cwd` 是 Windows 本地路径（例如 `C:\Users\me\project`）时，dashboard 执行 `code <cwd>`。
-- 提供了机器名且 `cwd` 不是 Windows 本地路径时，dashboard 执行 `code --remote ssh-remote+<machine> <cwd>`。
+- `cwd` 是 Windows 本地路径（例如 `C:\Users\me\project`）时，dashboard 执行 `code <cwd> --command chatgpt.openSidebar`。
+- 提供了机器名且 `cwd` 不是 Windows 本地路径时，dashboard 执行 `code --remote ssh-remote+<machine> <cwd> --command chatgpt.openSidebar`。
 
 远程打开依赖本机 VS Code 已安装 Remote-SSH 扩展，并且 `<machine>` 是本机 SSH 配置中可用的 Host alias，例如 `labgpu`。如果需要覆盖 VS Code CLI 路径，可以设置环境变量 `CODEX_DASHBOARD_CODE_CMD`。
 
@@ -198,7 +198,7 @@ Dashboard 会按以下顺序读取机器名：
 
 托盘悬停提示和右键菜单会在 transcript rate-limit 数据可用时显示最近一次已知 Codex 用量。
 
-点击托盘通知弹窗会在有路径时打开对应工作目录的 VS Code；没有路径时会新开一个 dashboard 页面。完成类视觉提醒会在 dashboard 标签页获得焦点后清除；也可以通过点击托盘通知弹窗或托盘菜单里的 Open Dashboard 清除。
+点击托盘通知弹窗会在有路径时打开对应工作目录的 VS Code 并聚焦 Codex 侧边栏；没有路径时会新开一个 dashboard 页面。完成类视觉提醒会在 dashboard 标签页获得焦点后清除；也可以通过点击托盘通知弹窗或托盘菜单里的 Open Dashboard 清除。
 
 左键点击或双击托盘图标会新开一个 dashboard 页面。
 
@@ -214,7 +214,7 @@ Dashboard 会按以下顺序读取机器名：
 
 托盘悬停提示和右键菜单会在 transcript rate-limit 数据可用时显示最近一次已知 Codex 用量。
 
-点击托盘通知弹窗会在有路径时打开对应工作目录的 VS Code；没有路径时会新开一个 dashboard 页面。
+点击托盘通知弹窗会在有路径时打开对应工作目录的 VS Code 并聚焦 Codex 侧边栏；没有路径时会新开一个 dashboard 页面。
 
 左键点击或双击托盘图标会新开一个 dashboard 页面。
 
