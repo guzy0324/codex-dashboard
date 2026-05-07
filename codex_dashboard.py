@@ -25,7 +25,6 @@ app = Flask(__name__)
 
 STORE_LOCK = threading.Lock()
 CONVERSATIONS: dict[str, dict] = {}
-PERMISSION_REQUESTS: list[dict] = []
 DONE_ALERTS: list[dict] = []
 TRANSCRIPT_QUOTA_CACHE: dict[str, dict] = {}
 
@@ -449,10 +448,22 @@ def add_done_attention_unlocked(
     del DONE_ALERTS[MAX_ALERTS:]
 
 
+def permission_alerts_unlocked() -> list[dict]:
+    alerts = []
+    for row in CONVERSATIONS.values():
+        alert = row.get("permission")
+        if row.get("status") == "permission" and isinstance(alert, dict):
+            alerts.append(alert.copy())
+
+    alerts.sort(key=lambda alert: alert.get("created_at_raw") or 0, reverse=True)
+    return alerts
+
+
 def current_attention_unlocked() -> dict:
-    if PERMISSION_REQUESTS:
-        alerts = PERMISSION_REQUESTS
-        alert = PERMISSION_REQUESTS[0]
+    permission_alerts = permission_alerts_unlocked()
+    if permission_alerts:
+        alerts = permission_alerts
+        alert = permission_alerts[0]
         kind, title, label = "permission", "Permission Needed", "Needs Permission"
         description = (
             alert.get("description")
@@ -536,33 +547,9 @@ def should_sound_on_stop(row: dict | None, transcript_path: str, last_msg: str) 
     return True
 
 
-def clear_permission_requests(session_id: str, turn_id: str) -> None:
-    if not session_id:
-        return
-
-    PERMISSION_REQUESTS[:] = [
-        alert for alert in PERMISSION_REQUESTS
-        if alert.get("session_id") != session_id
-        or (turn_id and alert.get("turn_id") != turn_id)
-    ]
-
-
 def is_current_turn(row: dict, turn_id: str) -> bool:
     current_turn_id = row.get("current_turn_id") or ""
     return not current_turn_id or not turn_id or current_turn_id == turn_id
-
-
-def is_active_turn(row: dict) -> bool:
-    return (row.get("status") or "") in ("thinking", "permission")
-
-
-def replace_permission_request_unlocked(alert: dict) -> None:
-    session_id = alert.get("session_id") or ""
-    if session_id:
-        clear_permission_requests(session_id, "")
-
-    PERMISSION_REQUESTS.insert(0, alert)
-    del PERMISSION_REQUESTS[MAX_ALERTS:]
 
 
 TITLE_PROMPT_MARKER = (
@@ -992,8 +979,8 @@ def refresh_interrupted_turns() -> None:
                 "status": "interrupted",
                 "updated_at": max(row.get("updated_at") or 0, completed_at),
                 "finished_at": completed_at,
+                "permission": None,
             })
-            clear_permission_requests(session_id, turn_id)
 
 
 def conversation_key(item: dict) -> str:
@@ -1168,8 +1155,6 @@ def user_prompt_submit():
     quota = quota_summary_from_payload(payload, t)
 
     with STORE_LOCK:
-        clear_permission_requests(session_id, "")
-
         row = CONVERSATIONS.get(session_id)
         if row:
             updates = {
@@ -1184,6 +1169,7 @@ def user_prompt_submit():
                 "started_at": t,
                 "finished_at": None,
                 "turn_count": row.get("turn_count", 0) + 1,
+                "permission": None,
             }
             if quota:
                 updates["quota"] = quota
@@ -1205,6 +1191,7 @@ def user_prompt_submit():
                 "finished_at": None,
                 "turn_count": 1,
                 "quota": quota or None,
+                "permission": None,
             }
 
     return jsonify({"ok": True})
@@ -1241,12 +1228,12 @@ def stop():
                     "transcript_path": transcript_path,
                     "updated_at": t,
                     "finished_at": t,
+                    "permission": None,
                 }
                 if quota:
                     updates["quota"] = quota
                 row.update(updates)
                 should_sound = should_sound_on_stop(row, transcript_path, last_msg)
-                clear_permission_requests(session_id, turn_id)
                 if should_sound:
                     add_done_attention_unlocked(
                         session_id,
@@ -1275,9 +1262,9 @@ def stop():
                 "finished_at": t,
                 "turn_count": 0,
                 "quota": quota or None,
+                "permission": None,
             }
             should_sound = should_sound_on_stop(None, transcript_path, last_msg)
-            clear_permission_requests(session_id, turn_id)
             if should_sound:
                 add_done_attention_unlocked(
                     session_id,
@@ -1307,11 +1294,15 @@ def permission_request():
         session_id = alert["session_id"]
         turn_id = alert["turn_id"]
         row = CONVERSATIONS.get(session_id)
-        if row and (not is_current_turn(row, turn_id) or not is_active_turn(row)):
+        if row and not is_current_turn(row, turn_id):
             return jsonify({"ok": True, "ignored": True})
 
-        replace_permission_request_unlocked(alert)
         if row:
+            alert = alert.copy()
+            alert["machine"] = alert.get("machine") or row.get("machine") or ""
+            alert["cwd"] = alert.get("cwd") or row.get("cwd") or ""
+            alert["display_cwd"] = display_path(alert.get("machine"), alert.get("cwd"))
+            alert["model"] = alert.get("model") or row.get("model") or ""
             row.update({
                 "status": "permission",
                 "current_turn_id": turn_id or row.get("current_turn_id") or "",
@@ -1319,7 +1310,27 @@ def permission_request():
                 "cwd": alert.get("cwd") or row.get("cwd") or "",
                 "model": alert.get("model") or row.get("model") or "",
                 "updated_at": alert["created_at_raw"],
+                "permission": alert,
             })
+        else:
+            CONVERSATIONS[session_id] = {
+                "session_id": session_id,
+                "status": "permission",
+                "current_turn_id": turn_id,
+                "machine": alert.get("machine") or "",
+                "cwd": alert.get("cwd") or "",
+                "model": alert.get("model") or "",
+                "prompt": "",
+                "last_assistant_message": "",
+                "transcript_path": payload.get("transcript_path") or "",
+                "created_at": alert["created_at_raw"],
+                "updated_at": alert["created_at_raw"],
+                "started_at": None,
+                "finished_at": None,
+                "turn_count": 0,
+                "quota": None,
+                "permission": alert,
+            }
 
     notify_attention_async()
     return jsonify({"ok": True})
@@ -1334,7 +1345,7 @@ def bell():
 @app.get("/api/permission_requests")
 def permission_requests():
     with STORE_LOCK:
-        return jsonify([alert.copy() for alert in PERMISSION_REQUESTS])
+        return jsonify(permission_alerts_unlocked())
 
 
 @app.get("/api/attention")
