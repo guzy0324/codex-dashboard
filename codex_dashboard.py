@@ -547,6 +547,24 @@ def clear_permission_requests(session_id: str, turn_id: str) -> None:
     ]
 
 
+def is_current_turn(row: dict, turn_id: str) -> bool:
+    current_turn_id = row.get("current_turn_id") or ""
+    return not current_turn_id or not turn_id or current_turn_id == turn_id
+
+
+def is_active_turn(row: dict) -> bool:
+    return (row.get("status") or "") in ("thinking", "permission")
+
+
+def replace_permission_request_unlocked(alert: dict) -> None:
+    session_id = alert.get("session_id") or ""
+    if session_id:
+        clear_permission_requests(session_id, "")
+
+    PERMISSION_REQUESTS.insert(0, alert)
+    del PERMISSION_REQUESTS[MAX_ALERTS:]
+
+
 TITLE_PROMPT_MARKER = (
     "You are a helpful assistant. You will be presented with a user prompt"
 )
@@ -1150,6 +1168,8 @@ def user_prompt_submit():
     quota = quota_summary_from_payload(payload, t)
 
     with STORE_LOCK:
+        clear_permission_requests(session_id, "")
+
         row = CONVERSATIONS.get(session_id)
         if row:
             updates = {
@@ -1209,10 +1229,8 @@ def stop():
     with STORE_LOCK:
         row = CONVERSATIONS.get(session_id)
         if row:
-            current_turn_id = row.get("current_turn_id") or ""
-
             # Prevent Stop from an older turn from overwriting a newer thinking turn.
-            if not current_turn_id or not turn_id or current_turn_id == turn_id:
+            if is_current_turn(row, turn_id):
                 updates = {
                     "status": "done",
                     "current_turn_id": turn_id,
@@ -1286,13 +1304,22 @@ def permission_request():
     alert = permission_summary(payload)
 
     with STORE_LOCK:
-        PERMISSION_REQUESTS.insert(0, alert)
-        del PERMISSION_REQUESTS[MAX_ALERTS:]
-
         session_id = alert["session_id"]
-        if session_id in CONVERSATIONS:
-            CONVERSATIONS[session_id]["status"] = "permission"
-            CONVERSATIONS[session_id]["updated_at"] = alert["created_at_raw"]
+        turn_id = alert["turn_id"]
+        row = CONVERSATIONS.get(session_id)
+        if row and (not is_current_turn(row, turn_id) or not is_active_turn(row)):
+            return jsonify({"ok": True, "ignored": True})
+
+        replace_permission_request_unlocked(alert)
+        if row:
+            row.update({
+                "status": "permission",
+                "current_turn_id": turn_id or row.get("current_turn_id") or "",
+                "machine": alert.get("machine") or row.get("machine") or "",
+                "cwd": alert.get("cwd") or row.get("cwd") or "",
+                "model": alert.get("model") or row.get("model") or "",
+                "updated_at": alert["created_at_raw"],
+            })
 
     notify_attention_async()
     return jsonify({"ok": True})
@@ -1483,6 +1510,11 @@ def index():
     .quota-value {
       color: #f8fafc;
       font-weight: 800;
+    }
+    .quota-reset {
+      color: #64748b;
+      font-size: 12px;
+      white-space: nowrap;
     }
     .quota-meter {
       width: 96px;
@@ -1684,6 +1716,7 @@ function renderQuotaWindow(window) {
       <span class="quota-label">${escapeHtml(label)}</span>
       <span class="quota-value">${remainingText}%</span>
       <span class="quota-meter"><span class="quota-fill ${state}" style="width: ${remaining}%"></span></span>
+      ${window.resets_at ? `<span class="quota-reset">reset: ${escapeHtml(window.resets_at)}</span>` : ''}
     </span>
   `;
 }
