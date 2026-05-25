@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
-import os
-import json
 import argparse
+import csv
+import json
+import locale
+import os
+import platform
+import shutil
+import subprocess
+import sys
+import tempfile
 import threading
 import time
-import platform
-import subprocess
-import shutil
-import sys
 import webbrowser
+import xml.etree.ElementTree as ET
 from datetime import datetime
 from flask import Flask, request, jsonify, Response
 from werkzeug.serving import make_server
@@ -17,7 +21,9 @@ APP_NAME = "Codex Dashboard"
 HOST = "127.0.0.1"
 PORT = 18765
 DASHBOARD_URL = f"http://{HOST}:{PORT}"
-STARTUP_LAUNCHER_NAME = "CodexDashboard.vbs"
+STARTUP_TASK_NAME = r"\Codex Dashboard"
+STARTUP_TASK_DELAY = "PT20S"
+TASK_XML_NAMESPACE = "http://schemas.microsoft.com/windows/2004/02/mit/task"
 MAX_ALERTS = 20
 VSCODE_CODEX_SIDEBAR_COMMAND = "chatgpt.openSidebar"
 
@@ -159,19 +165,11 @@ def windows_background_executable() -> str:
     return executable
 
 
-def startup_command(background: bool = False) -> str:
+def startup_action() -> tuple[str, str, str]:
     script = os.path.abspath(__file__)
-    executable = windows_background_executable() if background else (sys.executable or "python")
-    args = [executable, script, "--serve"]
-    if background:
-        args.append("--tray")
-    else:
-        args.append("--open-browser")
-    return subprocess.list2cmdline(args)
-
-
-def escape_vbs_string(value: str) -> str:
-    return value.replace('"', '""')
+    command = windows_background_executable()
+    arguments = subprocess.list2cmdline([script, "--serve", "--tray"])
+    return command, arguments, os.path.dirname(script)
 
 
 def open_dashboard_url() -> None:
@@ -193,54 +191,164 @@ def open_dashboard_browser() -> None:
     run_daemon_thread(_open)
 
 
-def startup_folder_path() -> str:
-    appdata = os.environ.get("APPDATA")
-    if not appdata:
-        raise RuntimeError("APPDATA is not set; cannot install the startup launcher")
-    return os.path.join(
-        appdata,
-        "Microsoft",
-        "Windows",
-        "Start Menu",
-        "Programs",
-        "Startup",
-    )
+def decode_windows_output(output: bytes) -> str:
+    if output.startswith((b"\xff\xfe", b"\xfe\xff")):
+        return output.decode("utf-16", errors="replace")
+    if b"\x00" in output[:80]:
+        return output.decode("utf-16-le", errors="replace")
+    return output.decode(locale.getpreferredencoding(False), errors="replace")
 
 
-def startup_launcher_path() -> str:
-    return os.path.join(startup_folder_path(), STARTUP_LAUNCHER_NAME)
+def run_windows_process(arguments: list[str]) -> subprocess.CompletedProcess[bytes]:
+    try:
+        return subprocess.run(
+            arguments,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except OSError as exc:
+        raise RuntimeError(f"Unable to run {arguments[0]}: {exc}") from exc
+
+
+def process_error(result: subprocess.CompletedProcess[bytes]) -> str:
+    detail = decode_windows_output(result.stderr or result.stdout).strip()
+    return detail or f"process exited with status {result.returncode}"
+
+
+def current_windows_user_sid() -> str:
+    result = run_windows_process(["whoami.exe", "/user", "/fo", "csv", "/nh"])
+    if result.returncode != 0:
+        raise RuntimeError(f"Unable to determine the current Windows user: {process_error(result)}")
+
+    text = decode_windows_output(result.stdout).lstrip("\ufeff").strip()
+    try:
+        row = next(csv.reader(text.splitlines()))
+    except StopIteration as exc:
+        raise RuntimeError("Unable to determine the current Windows user SID") from exc
+    if len(row) < 2 or not row[1].strip():
+        raise RuntimeError("Unable to determine the current Windows user SID")
+    return row[1].strip()
+
+
+def task_xml_element(parent: ET.Element, name: str, text: str | None = None) -> ET.Element:
+    element = ET.SubElement(parent, f"{{{TASK_XML_NAMESPACE}}}{name}")
+    if text is not None:
+        element.text = text
+    return element
+
+
+def build_startup_task_xml(user_sid: str) -> bytes:
+    ET.register_namespace("", TASK_XML_NAMESPACE)
+    task = ET.Element(f"{{{TASK_XML_NAMESPACE}}}Task", {"version": "1.3"})
+    command, arguments, working_directory = startup_action()
+
+    registration_info = task_xml_element(task, "RegistrationInfo")
+    task_xml_element(registration_info, "Description", "Start Codex Dashboard at user logon.")
+
+    triggers = task_xml_element(task, "Triggers")
+    logon_trigger = task_xml_element(triggers, "LogonTrigger")
+    task_xml_element(logon_trigger, "Enabled", "true")
+    task_xml_element(logon_trigger, "UserId", user_sid)
+    task_xml_element(logon_trigger, "Delay", STARTUP_TASK_DELAY)
+
+    principals = task_xml_element(task, "Principals")
+    principal = task_xml_element(principals, "Principal")
+    principal.set("id", "Author")
+    task_xml_element(principal, "UserId", user_sid)
+    task_xml_element(principal, "LogonType", "InteractiveToken")
+    task_xml_element(principal, "RunLevel", "LeastPrivilege")
+
+    settings = task_xml_element(task, "Settings")
+    task_xml_element(settings, "MultipleInstancesPolicy", "IgnoreNew")
+    task_xml_element(settings, "DisallowStartIfOnBatteries", "false")
+    task_xml_element(settings, "StopIfGoingOnBatteries", "false")
+    task_xml_element(settings, "AllowHardTerminate", "true")
+    task_xml_element(settings, "AllowStartOnDemand", "true")
+    task_xml_element(settings, "Enabled", "true")
+    task_xml_element(settings, "ExecutionTimeLimit", "PT0S")
+    restart = task_xml_element(settings, "RestartOnFailure")
+    task_xml_element(restart, "Interval", "PT1M")
+    task_xml_element(restart, "Count", "3")
+
+    actions = task_xml_element(task, "Actions")
+    actions.set("Context", "Author")
+    action = task_xml_element(actions, "Exec")
+    task_xml_element(action, "Command", command)
+    task_xml_element(action, "Arguments", arguments)
+    task_xml_element(action, "WorkingDirectory", working_directory)
+
+    return ET.tostring(task, encoding="utf-16", xml_declaration=True)
+
+
+def query_startup_task() -> ET.Element | None:
+    result = run_windows_process(["schtasks.exe", "/Query", "/TN", STARTUP_TASK_NAME, "/XML"])
+    if result.returncode != 0:
+        return None
+    try:
+        return ET.fromstring(decode_windows_output(result.stdout))
+    except ET.ParseError as exc:
+        raise RuntimeError("Windows returned an invalid startup task definition") from exc
 
 
 def install_startup() -> None:
     if not is_windows():
         raise RuntimeError("Startup installation is currently only supported on Windows")
 
-    launcher_path = startup_launcher_path()
-    command = startup_command(background=True)
-    os.makedirs(os.path.dirname(launcher_path), exist_ok=True)
-    content = (
-        "' Codex Dashboard startup launcher\n"
-        "Set shell = CreateObject(\"WScript.Shell\")\n"
-        f"shell.Run \"{escape_vbs_string(command)}\", 0, False\n"
-    )
-    with open(launcher_path, "w", encoding="utf-8", newline="\r\n") as f:
-        f.write(content)
+    task_path = ""
+    try:
+        with tempfile.NamedTemporaryFile(prefix="codex-dashboard-", suffix=".xml", delete=False) as task_file:
+            task_file.write(build_startup_task_xml(current_windows_user_sid()))
+            task_path = task_file.name
+        result = run_windows_process(
+            ["schtasks.exe", "/Create", "/TN", STARTUP_TASK_NAME, "/XML", task_path, "/F"]
+        )
+        if result.returncode != 0:
+            raise RuntimeError(f"Unable to register the startup task: {process_error(result)}")
+    finally:
+        if task_path and os.path.exists(task_path):
+            os.remove(task_path)
 
 
 def uninstall_startup() -> None:
     if not is_windows():
         raise RuntimeError("Startup uninstallation is currently only supported on Windows")
 
-    path = startup_launcher_path()
-    if os.path.exists(path):
-        os.remove(path)
+    if query_startup_task() is not None:
+        result = run_windows_process(["schtasks.exe", "/Delete", "/TN", STARTUP_TASK_NAME, "/F"])
+        if result.returncode != 0 and query_startup_task() is not None:
+            raise RuntimeError(f"Unable to remove the startup task: {process_error(result)}")
+
+
+def startup_status() -> str:
+    if not is_windows():
+        return "not installed"
+
+    task = query_startup_task()
+    if task is None:
+        return "not installed"
+
+    namespace = {"task": TASK_XML_NAMESPACE}
+    enabled = task.findtext("./task:Settings/task:Enabled", "true", namespace).lower()
+    logon_trigger = task.find("./task:Triggers/task:LogonTrigger", namespace)
+    action = task.find("./task:Actions/task:Exec", namespace)
+    command, arguments, working_directory = startup_action()
+    installed_action = (
+        action is not None
+        and os.path.normcase(action.findtext("task:Command", "", namespace)) == os.path.normcase(command)
+        and action.findtext("task:Arguments", "", namespace) == arguments
+        and os.path.normcase(action.findtext("task:WorkingDirectory", "", namespace))
+        == os.path.normcase(working_directory)
+    )
+    if enabled != "true":
+        return "disabled"
+    if logon_trigger is None or not installed_action:
+        return "outdated"
+    return "installed"
 
 
 def has_startup_task() -> bool:
-    if not is_windows():
-        return False
-
-    return os.path.exists(startup_launcher_path())
+    return startup_status() == "installed"
 
 
 def safe_short(text: str | None, limit: int = 300) -> str:
@@ -2347,7 +2455,7 @@ def main() -> int:
     parser.add_argument(
         "--startup-status",
         action="store_true",
-        help="print whether the startup launcher exists",
+        help="print the Windows startup task status",
     )
     parser.add_argument(
         "--open-browser",
@@ -2363,16 +2471,16 @@ def main() -> int:
 
     if args.install_startup:
         install_startup()
-        print(f"Installed startup launcher: {startup_launcher_path()}")
+        print(f"Installed startup task: {STARTUP_TASK_NAME}")
         return 0
 
     if args.uninstall_startup:
         uninstall_startup()
-        print(f"Removed startup launcher: {startup_launcher_path()}")
+        print(f"Removed startup task: {STARTUP_TASK_NAME}")
         return 0
 
     if args.startup_status:
-        print("installed" if has_startup_task() else "not installed")
+        print(startup_status())
         return 0
 
     if args.tray:

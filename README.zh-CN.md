@@ -61,25 +61,29 @@ python codex_dashboard.py --serve --tray
 
 ## Windows 开机自启
 
-在 Windows 上，可以把一个小启动脚本放到用户的 Startup 文件夹中，让 dashboard 在登录时自动启动。该脚本会在后台启动服务，并在时钟附近显示 Windows 通知区域图标：
+在 Windows 上，可以注册一个当前用户的计划任务，让 dashboard 在登录后自动启动并在时钟附近显示通知区域图标：
 
 ```powershell
 python codex_dashboard.py --install-startup
 ```
 
-检查启动脚本是否存在：
+该任务会延迟 20 秒启动，避开登录阶段的高负载；允许在使用电池时运行，并在进程异常退出时最多重启 3 次。由于托盘图标依赖用户桌面会话，此处使用“用户登录”触发而不是系统启动触发。
+
+检查计划任务状态：
 
 ```powershell
 python codex_dashboard.py --startup-status
 ```
 
-移除开机自启脚本：
+输出为 `installed` 时任务已配置且与当前脚本位置匹配；输出为 `outdated` 或 `disabled` 时，重新执行 `--install-startup` 即可修复配置。
+
+移除开机自启任务：
 
 ```powershell
 python codex_dashboard.py --uninstall-startup
 ```
 
-启动脚本会使用当前 Python 解释器，并执行：
+计划任务会使用当前 Python 解释器，并执行：
 
 ```text
 pythonw codex_dashboard.py --serve --tray

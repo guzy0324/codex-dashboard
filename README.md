@@ -64,27 +64,35 @@ environment that can reach `127.0.0.1:18765` from the hook commands.
 
 ## Windows Startup
 
-On Windows, you can register the dashboard to start at logon by placing a
-small launcher in the user's Startup folder. The launcher starts the server in
-the background and shows a Windows notification-area icon near the clock:
+On Windows, register a per-user scheduled task to start the dashboard after
+logon. It starts the server in the background and shows a Windows
+notification-area icon near the clock:
 
 ```powershell
 python codex_dashboard.py --install-startup
 ```
 
-Check whether the launcher exists:
+The task waits 20 seconds to avoid logon contention, runs while on battery
+power, and retries up to three times if the process exits unexpectedly. It is
+triggered at user logon rather than system boot because the tray icon requires
+an interactive desktop session.
+
+Check the task state:
 
 ```powershell
 python codex_dashboard.py --startup-status
 ```
 
-Remove the startup launcher:
+`installed` means the task is enabled and matches the current script path. For
+`outdated` or `disabled`, run `--install-startup` again to repair it.
+
+Remove the startup task:
 
 ```powershell
 python codex_dashboard.py --uninstall-startup
 ```
 
-The launcher starts the dashboard with the current Python interpreter and runs:
+The task uses the current Python interpreter and runs:
 
 ```text
 pythonw codex_dashboard.py --serve --tray
