@@ -5,6 +5,7 @@ import json
 import locale
 import os
 import platform
+import signal
 import shutil
 import subprocess
 import sys
@@ -23,16 +24,42 @@ PORT = 18765
 DASHBOARD_URL = f"http://{HOST}:{PORT}"
 STARTUP_TASK_NAME = r"\Codex Dashboard"
 STARTUP_TASK_DELAY = "PT20S"
+STARTUP_CONTROL_ARGUMENTS = frozenset({
+    "--install-startup",
+    "--uninstall-startup",
+    "--startup-status",
+})
 TASK_XML_NAMESPACE = "http://schemas.microsoft.com/windows/2004/02/mit/task"
 MAX_ALERTS = 20
 VSCODE_CODEX_SIDEBAR_COMMAND = "chatgpt.openSidebar"
+CODEX_REMOTE_SUBCOMMAND = "remote-control"
+CODEX_REMOTE_MENU_LABEL = "Codex Remote Control"
+CODEX_REMOTE_START_TIMEOUT_SECONDS = 15.0
+CODEX_REMOTE_STOP_TIMEOUT_SECONDS = 15.0
 
 app = Flask(__name__)
 
 STORE_LOCK = threading.Lock()
+REMOTE_CONTROL_LOCK = threading.Lock()
+REMOTE_CONTROL_STATUS_LOCK = threading.Lock()
 CONVERSATIONS: dict[str, dict] = {}
 DONE_ALERTS: list[dict] = []
 TRANSCRIPT_QUOTA_CACHE: dict[str, dict] = {}
+REMOTE_CONTROL_STATUS_CACHE = {
+    "available": False,
+    "running": False,
+    "pids": [],
+    "error": "",
+    "loading": True,
+    "starting": False,
+    "starting_until": 0.0,
+    "stopping": False,
+    "stopping_until": 0.0,
+}
+
+
+class RemoteControlProbeCancelled(Exception):
+    pass
 
 
 def now_ts() -> float:
@@ -165,11 +192,16 @@ def windows_background_executable() -> str:
     return executable
 
 
-def startup_action() -> tuple[str, str, str]:
+def startup_action(arguments: list[str] | None = None) -> tuple[str, str, str]:
     script = os.path.abspath(__file__)
     command = windows_background_executable()
-    arguments = subprocess.list2cmdline([script, "--serve", "--tray"])
-    return command, arguments, os.path.dirname(script)
+    startup_arguments = [
+        argument
+        for argument in (arguments or [])
+        if argument not in STARTUP_CONTROL_ARGUMENTS
+    ]
+    command_line = subprocess.list2cmdline([script, *startup_arguments])
+    return command, command_line, os.path.dirname(script)
 
 
 def open_dashboard_url() -> None:
@@ -238,10 +270,13 @@ def task_xml_element(parent: ET.Element, name: str, text: str | None = None) -> 
     return element
 
 
-def build_startup_task_xml(user_sid: str) -> bytes:
+def build_startup_task_xml(
+    user_sid: str,
+    arguments: list[str] | None = None,
+) -> bytes:
     ET.register_namespace("", TASK_XML_NAMESPACE)
     task = ET.Element(f"{{{TASK_XML_NAMESPACE}}}Task", {"version": "1.3"})
-    command, arguments, working_directory = startup_action()
+    command, action_arguments, working_directory = startup_action(arguments)
 
     registration_info = task_xml_element(task, "RegistrationInfo")
     task_xml_element(registration_info, "Description", "Start Codex Dashboard at user logon.")
@@ -275,7 +310,7 @@ def build_startup_task_xml(user_sid: str) -> bytes:
     actions.set("Context", "Author")
     action = task_xml_element(actions, "Exec")
     task_xml_element(action, "Command", command)
-    task_xml_element(action, "Arguments", arguments)
+    task_xml_element(action, "Arguments", action_arguments)
     task_xml_element(action, "WorkingDirectory", working_directory)
 
     return ET.tostring(task, encoding="utf-16", xml_declaration=True)
@@ -291,14 +326,19 @@ def query_startup_task() -> ET.Element | None:
         raise RuntimeError("Windows returned an invalid startup task definition") from exc
 
 
-def install_startup() -> None:
+def install_startup(arguments: list[str] | None = None) -> None:
     if not is_windows():
         raise RuntimeError("Startup installation is currently only supported on Windows")
 
     task_path = ""
     try:
         with tempfile.NamedTemporaryFile(prefix="codex-dashboard-", suffix=".xml", delete=False) as task_file:
-            task_file.write(build_startup_task_xml(current_windows_user_sid()))
+            task_file.write(
+                build_startup_task_xml(
+                    current_windows_user_sid(),
+                    arguments=arguments,
+                )
+            )
             task_path = task_file.name
         result = run_windows_process(
             ["schtasks.exe", "/Create", "/TN", STARTUP_TASK_NAME, "/XML", task_path, "/F"]
@@ -320,7 +360,7 @@ def uninstall_startup() -> None:
             raise RuntimeError(f"Unable to remove the startup task: {process_error(result)}")
 
 
-def startup_status() -> str:
+def startup_status(arguments: list[str] | None = None) -> str:
     if not is_windows():
         return "not installed"
 
@@ -332,11 +372,11 @@ def startup_status() -> str:
     enabled = task.findtext("./task:Settings/task:Enabled", "true", namespace).lower()
     logon_trigger = task.find("./task:Triggers/task:LogonTrigger", namespace)
     action = task.find("./task:Actions/task:Exec", namespace)
-    command, arguments, working_directory = startup_action()
+    command, expected_arguments, working_directory = startup_action(arguments)
     installed_action = (
         action is not None
         and os.path.normcase(action.findtext("task:Command", "", namespace)) == os.path.normcase(command)
-        and action.findtext("task:Arguments", "", namespace) == arguments
+        and action.findtext("task:Arguments", "", namespace) == expected_arguments
         and os.path.normcase(action.findtext("task:WorkingDirectory", "", namespace))
         == os.path.normcase(working_directory)
     )
@@ -347,8 +387,359 @@ def startup_status() -> str:
     return "installed"
 
 
-def has_startup_task() -> bool:
-    return startup_status() == "installed"
+def has_startup_task(arguments: list[str] | None = None) -> bool:
+    return startup_status(arguments) == "installed"
+
+
+def codex_cli_command() -> str | None:
+    configured = (os.environ.get("CODEX_DASHBOARD_CODEX_CMD") or "").strip()
+    if configured:
+        return configured
+
+    return "codex" if shutil.which("codex") else None
+
+
+def cancellable_communicate(process: subprocess.Popen, cancel_event: threading.Event | None):
+    if cancel_event is None:
+        return process.communicate()
+
+    while process.poll() is None:
+        if cancel_event.wait(0.05):
+            try:
+                process.terminate()
+            except OSError:
+                pass
+            try:
+                process.communicate(timeout=0.5)
+            except subprocess.TimeoutExpired:
+                try:
+                    process.kill()
+                except OSError:
+                    pass
+                process.communicate()
+            raise RemoteControlProbeCancelled()
+
+    return process.communicate()
+
+
+def process_rows(cancel_event: threading.Event | None = None) -> list[dict]:
+    if is_windows():
+        script = (
+            """Get-CimInstance Win32_Process -Filter "Name='codex.exe' OR Name='node.exe'" | """
+            "Select-Object ProcessId,Name,CommandLine | ConvertTo-Json -Compress"
+        )
+        arguments = ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script]
+        try:
+            process = subprocess.Popen(
+                arguments,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+            )
+        except OSError as exc:
+            raise RuntimeError(f"Unable to run {arguments[0]}: {exc}") from exc
+
+        stdout, stderr = cancellable_communicate(process, cancel_event)
+        result = subprocess.CompletedProcess(arguments, process.returncode, stdout, stderr)
+        if result.returncode != 0:
+            raise RuntimeError(f"Unable to inspect processes: {process_error(result)}")
+
+        text = decode_windows_output(result.stdout).lstrip("\ufeff").strip()
+        if not text:
+            return []
+        try:
+            rows = json.loads(text)
+        except ValueError as exc:
+            raise RuntimeError("Unable to inspect processes: invalid Windows process data") from exc
+        return rows if isinstance(rows, list) else [rows]
+
+    try:
+        process = subprocess.Popen(
+            ["ps", "-eo", "pid=,comm=,args="],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+    except OSError as exc:
+        raise RuntimeError(f"Unable to inspect processes: {exc}") from exc
+    stdout, stderr = cancellable_communicate(process, cancel_event)
+    result = subprocess.CompletedProcess(
+        ["ps", "-eo", "pid=,comm=,args="],
+        process.returncode,
+        stdout,
+        stderr,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or "").strip()
+        raise RuntimeError(detail or f"Unable to inspect processes: ps exited with status {result.returncode}")
+
+    rows = []
+    for line in (result.stdout or "").splitlines():
+        fields = line.strip().split(None, 2)
+        if len(fields) < 2:
+            continue
+        rows.append({
+            "ProcessId": fields[0],
+            "Name": fields[1],
+            "CommandLine": fields[2] if len(fields) > 2 else fields[1],
+        })
+    return rows
+
+
+def is_codex_remote_control_process(row: dict) -> bool:
+    process_name = os.path.basename(str(row.get("Name") or "")).lower()
+    command_line = str(row.get("CommandLine") or "").lower()
+    if CODEX_REMOTE_SUBCOMMAND not in command_line:
+        return False
+    if process_name in ("codex", "codex.exe"):
+        return True
+    return (
+        process_name in ("node", "node.exe")
+        and ("codex.js" in command_line or "@openai/codex" in command_line.replace("\\", "/"))
+    )
+
+
+def codex_remote_control_status(cancel_event: threading.Event | None = None) -> dict:
+    command = codex_cli_command()
+    try:
+        processes = [
+            row
+            for row in process_rows(cancel_event)
+            if is_codex_remote_control_process(row)
+        ]
+    except RuntimeError as exc:
+        return {
+            "available": bool(command),
+            "running": False,
+            "pids": [],
+            "error": str(exc),
+        }
+
+    pids = []
+    for row in processes:
+        try:
+            pid = int(row.get("ProcessId") or 0)
+        except (TypeError, ValueError):
+            continue
+        if pid and pid not in pids:
+            pids.append(pid)
+
+    return {
+        "available": bool(command),
+        "running": bool(processes),
+        "pids": pids,
+        "error": "",
+    }
+
+
+def cached_codex_remote_control_status() -> dict:
+    with REMOTE_CONTROL_STATUS_LOCK:
+        clear_expired_codex_remote_control_transition_unlocked()
+        status = REMOTE_CONTROL_STATUS_CACHE.copy()
+        status["pids"] = list(REMOTE_CONTROL_STATUS_CACHE["pids"])
+        return status
+
+
+def clear_expired_codex_remote_control_transition_unlocked() -> None:
+    if (
+        REMOTE_CONTROL_STATUS_CACHE["starting"]
+        and REMOTE_CONTROL_STATUS_CACHE["starting_until"] <= time.monotonic()
+    ):
+        REMOTE_CONTROL_STATUS_CACHE["starting"] = False
+        REMOTE_CONTROL_STATUS_CACHE["starting_until"] = 0.0
+    if (
+        REMOTE_CONTROL_STATUS_CACHE["stopping"]
+        and REMOTE_CONTROL_STATUS_CACHE["stopping_until"] <= time.monotonic()
+    ):
+        REMOTE_CONTROL_STATUS_CACHE["stopping"] = False
+        REMOTE_CONTROL_STATUS_CACHE["stopping_until"] = 0.0
+
+
+def store_codex_remote_control_status(
+    status: dict,
+    finish_starting: bool = False,
+    finish_stopping: bool = False,
+) -> dict:
+    with REMOTE_CONTROL_STATUS_LOCK:
+        clear_expired_codex_remote_control_transition_unlocked()
+        running = bool(status.get("running"))
+        starting = REMOTE_CONTROL_STATUS_CACHE["starting"]
+        if running or finish_starting:
+            starting = False
+        stopping = REMOTE_CONTROL_STATUS_CACHE["stopping"]
+        if not running or finish_stopping:
+            stopping = False
+
+        REMOTE_CONTROL_STATUS_CACHE.update({
+            "available": bool(status.get("available")),
+            "running": running,
+            "pids": list(status.get("pids") or []),
+            "error": str(status.get("error") or ""),
+            "loading": False,
+            "starting": starting,
+            "starting_until": (
+                REMOTE_CONTROL_STATUS_CACHE["starting_until"]
+                if starting
+                else 0.0
+            ),
+            "stopping": stopping,
+            "stopping_until": (
+                REMOTE_CONTROL_STATUS_CACHE["stopping_until"]
+                if stopping
+                else 0.0
+            ),
+        })
+        stored = REMOTE_CONTROL_STATUS_CACHE.copy()
+        stored["pids"] = list(REMOTE_CONTROL_STATUS_CACHE["pids"])
+        return stored
+
+
+def mark_codex_remote_control_loading() -> None:
+    with REMOTE_CONTROL_STATUS_LOCK:
+        clear_expired_codex_remote_control_transition_unlocked()
+        REMOTE_CONTROL_STATUS_CACHE["loading"] = not (
+            REMOTE_CONTROL_STATUS_CACHE["starting"]
+            or REMOTE_CONTROL_STATUS_CACHE["stopping"]
+        )
+        REMOTE_CONTROL_STATUS_CACHE["error"] = ""
+
+
+def set_codex_remote_control_starting() -> bool:
+    with REMOTE_CONTROL_STATUS_LOCK:
+        clear_expired_codex_remote_control_transition_unlocked()
+        if (
+            REMOTE_CONTROL_STATUS_CACHE["starting"]
+            or REMOTE_CONTROL_STATUS_CACHE["stopping"]
+            or REMOTE_CONTROL_STATUS_CACHE["running"]
+        ):
+            return False
+        REMOTE_CONTROL_STATUS_CACHE["loading"] = False
+        REMOTE_CONTROL_STATUS_CACHE["error"] = ""
+        REMOTE_CONTROL_STATUS_CACHE["starting"] = True
+        REMOTE_CONTROL_STATUS_CACHE["starting_until"] = (
+            time.monotonic() + CODEX_REMOTE_START_TIMEOUT_SECONDS
+        )
+        return True
+
+
+def set_codex_remote_control_stopping() -> bool:
+    with REMOTE_CONTROL_STATUS_LOCK:
+        clear_expired_codex_remote_control_transition_unlocked()
+        if (
+            REMOTE_CONTROL_STATUS_CACHE["starting"]
+            or REMOTE_CONTROL_STATUS_CACHE["stopping"]
+            or not REMOTE_CONTROL_STATUS_CACHE["running"]
+        ):
+            return False
+        REMOTE_CONTROL_STATUS_CACHE["loading"] = False
+        REMOTE_CONTROL_STATUS_CACHE["error"] = ""
+        REMOTE_CONTROL_STATUS_CACHE["stopping"] = True
+        REMOTE_CONTROL_STATUS_CACHE["stopping_until"] = (
+            time.monotonic() + CODEX_REMOTE_STOP_TIMEOUT_SECONDS
+        )
+        return True
+
+
+def start_codex_remote_control(check_running: bool = True) -> None:
+    with REMOTE_CONTROL_LOCK:
+        if check_running:
+            status = codex_remote_control_status()
+            if status["error"]:
+                raise RuntimeError(status["error"])
+            if status["running"]:
+                return
+
+        command = codex_cli_command()
+        if not command:
+            raise RuntimeError("Codex CLI was not found in PATH")
+
+        kwargs = {
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.DEVNULL,
+            "stderr": subprocess.DEVNULL,
+        }
+        if is_windows():
+            kwargs["creationflags"] = (
+                getattr(subprocess, "CREATE_NO_WINDOW", 0)
+                | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                | getattr(subprocess, "DETACHED_PROCESS", 0)
+            )
+        else:
+            kwargs["start_new_session"] = True
+
+        try:
+            process = subprocess.Popen([command, CODEX_REMOTE_SUBCOMMAND], **kwargs)
+        except OSError as exc:
+            raise RuntimeError(f"Unable to start Codex Remote Control: {exc}") from exc
+
+        time.sleep(0.2)
+        returncode = process.poll()
+        if returncode is not None:
+            raise RuntimeError(
+                f"Codex Remote Control exited immediately with status {returncode}"
+            )
+
+
+def stop_codex_remote_control() -> None:
+    with REMOTE_CONTROL_LOCK:
+        status = codex_remote_control_status()
+        if status["error"]:
+            raise RuntimeError(status["error"])
+        if not status["running"]:
+            return
+
+        pids = [str(pid) for pid in status["pids"] if pid]
+        if not pids:
+            return
+
+        if is_windows():
+            arguments = ["taskkill.exe", "/T", "/F"]
+            for pid in pids:
+                arguments.extend(["/PID", pid])
+            result = run_windows_process(arguments)
+            if result.returncode != 0:
+                remaining = codex_remote_control_status()
+                if remaining["running"]:
+                    raise RuntimeError(
+                        f"Unable to stop Codex Remote Control: {process_error(result)}"
+                    )
+            return
+
+        for pid in pids:
+            try:
+                os.kill(int(pid), signal.SIGTERM)
+            except ProcessLookupError:
+                continue
+            except OSError as exc:
+                raise RuntimeError(f"Unable to stop Codex Remote Control: {exc}") from exc
+
+
+def start_codex_remote_control_async(
+    check_running: bool = True,
+    on_error=None,
+) -> bool:
+    if not set_codex_remote_control_starting():
+        return False
+
+    def _start() -> None:
+        error = ""
+        try:
+            start_codex_remote_control(check_running=check_running)
+            status = codex_remote_control_status()
+        except RuntimeError as exc:
+            error = str(exc)
+            status = {
+                "available": bool(codex_cli_command()),
+                "running": False,
+                "pids": [],
+                "error": error,
+            }
+        store_codex_remote_control_status(status, finish_starting=bool(error))
+        if error and on_error:
+            on_error(error)
+
+    run_daemon_thread(_start)
+    return True
 
 
 def safe_short(text: str | None, limit: int = 300) -> str:
@@ -2282,20 +2673,34 @@ def run_tray_attention_loop(icon, tray_images: dict, stop_event: threading.Event
         pass
 
 
-def run_server_blocking(open_browser: bool) -> int:
+def run_server_blocking(open_browser: bool, start_remote_control: bool = False) -> int:
     print(f"Codex dashboard: {DASHBOARD_URL}")
     if open_browser:
         open_dashboard_browser()
+    if start_remote_control:
+        start_codex_remote_control_async(
+            on_error=lambda error: print(
+                f"Could not start Codex Remote Control: {error}",
+                file=sys.stderr,
+            )
+        )
     app.run(host=HOST, port=PORT, debug=False, threaded=True)
     return 0
 
 
-def run_server_with_tray(open_browser: bool) -> int:
+def run_server_with_tray(
+    open_browser: bool,
+    start_remote_control: bool = False,
+    startup_arguments: list[str] | None = None,
+) -> int:
     if not is_windows():
         print("Tray mode is currently only supported on Windows; falling back to normal service mode.")
-        return run_server_blocking(open_browser)
+        return run_server_blocking(open_browser, start_remote_control)
 
     try:
+        import ctypes
+        from ctypes import wintypes
+
         import pystray
         from pystray._util import win32 as pystray_win32
         tray_images = create_tray_images()
@@ -2322,12 +2727,28 @@ def run_server_with_tray(open_browser: bool) -> int:
     tray_activate_events = {pystray_win32.WM_LBUTTONUP, 0x0203}
     tray_context_menu_event = getattr(pystray_win32, "WM_RBUTTONUP", 0x0205)
     tray_open_cooldown_seconds = 0.75
+    remote_menu_item_id = {"value": 0}
+    set_menu_item_info = ctypes.windll.user32.SetMenuItemInfoW
+    set_menu_item_info.argtypes = (
+        wintypes.HMENU,
+        wintypes.UINT,
+        wintypes.BOOL,
+        ctypes.POINTER(pystray_win32.MENUITEMINFO),
+    )
+    set_menu_item_info.restype = wintypes.BOOL
+    draw_menu_bar = ctypes.windll.user32.DrawMenuBar
+    draw_menu_bar.argtypes = (wintypes.HWND,)
+    draw_menu_bar.restype = wintypes.BOOL
 
     class DashboardTrayIcon(pystray.Icon):
         def __init__(self, *args, notification_click=None, tray_activate=None, **kwargs):
             self._notification_click = notification_click
             self._tray_activate = tray_activate
             self._last_tray_open_at = 0.0
+            self._remote_probe_lock = threading.Lock()
+            self._remote_probe_id = 0
+            self._remote_probe_cancel = None
+            self._remote_menu_open = False
             super().__init__(*args, **kwargs)
 
         def _handle_callback(self, callback) -> None:
@@ -2342,6 +2763,108 @@ def run_server_with_tray(open_browser: bool) -> int:
             self._last_tray_open_at = opened_at
             self._handle_callback(self._tray_activate)
 
+        def _update_open_remote_item(self, probe_id: int, status: dict) -> None:
+            with self._remote_probe_lock:
+                if probe_id != self._remote_probe_id or not self._remote_menu_open:
+                    return
+                menu_handle = self._menu_handle
+
+            command_id = remote_menu_item_id["value"]
+            if not menu_handle or not command_id:
+                return
+
+            checked = remote_control_checked_value(status)
+            state = (
+                pystray_win32.MFS_CHECKED
+                if checked
+                else pystray_win32.MFS_UNCHECKED
+            )
+            if not remote_control_enabled_value(status):
+                state |= pystray_win32.MFS_DISABLED
+
+            menu_item = pystray_win32.MENUITEMINFO(
+                cbSize=ctypes.sizeof(pystray_win32.MENUITEMINFO),
+                fMask=pystray_win32.MIIM_STRING | pystray_win32.MIIM_STATE,
+                dwTypeData=remote_control_text_value(status),
+                fState=state,
+            )
+            try:
+                set_menu_item_info(menu_handle[0], command_id, False, ctypes.byref(menu_item))
+                draw_menu_bar(self._menu_hwnd)
+            except Exception:
+                pass
+
+        def _begin_remote_probe(self) -> None:
+            with self._remote_probe_lock:
+                previous_cancel = self._remote_probe_cancel
+                self._remote_probe_id += 1
+                probe_id = self._remote_probe_id
+                cancel_event = threading.Event()
+                self._remote_probe_cancel = cancel_event
+                self._remote_menu_open = True
+
+            if previous_cancel:
+                previous_cancel.set()
+
+            mark_codex_remote_control_loading()
+            self.update_menu()
+
+            def _probe() -> None:
+                try:
+                    status = codex_remote_control_status(cancel_event)
+                except RemoteControlProbeCancelled:
+                    return
+
+                with self._remote_probe_lock:
+                    if (
+                        probe_id != self._remote_probe_id
+                        or not self._remote_menu_open
+                        or cancel_event.is_set()
+                    ):
+                        return
+
+                status = store_codex_remote_control_status(status)
+                self._update_open_remote_item(probe_id, status)
+
+            run_daemon_thread(_probe)
+
+        def _end_remote_probe(self) -> None:
+            with self._remote_probe_lock:
+                self._remote_menu_open = False
+                self._remote_probe_id += 1
+                cancel_event = self._remote_probe_cancel
+                self._remote_probe_cancel = None
+
+            if cancel_event:
+                cancel_event.set()
+
+        def _show_context_menu(self) -> None:
+            self._begin_remote_probe()
+            if not self._menu_handle:
+                self._end_remote_probe()
+                return
+
+            pystray_win32.SetForegroundWindow(self._hwnd)
+            point = wintypes.POINT()
+            pystray_win32.GetCursorPos(ctypes.byref(point))
+            hmenu, descriptors = self._menu_handle
+            try:
+                index = pystray_win32.TrackPopupMenuEx(
+                    hmenu,
+                    pystray_win32.TPM_RIGHTALIGN
+                    | pystray_win32.TPM_BOTTOMALIGN
+                    | pystray_win32.TPM_RETURNCMD,
+                    point.x,
+                    point.y,
+                    self._menu_hwnd,
+                    None,
+                )
+            finally:
+                self._end_remote_probe()
+
+            if index > 0:
+                descriptors[index - 1](self)
+
         def _on_notify(self, wparam, lparam):
             if lparam == notification_click_event:
                 self._handle_callback(self._notification_click)
@@ -2352,9 +2875,10 @@ def run_server_with_tray(open_browser: bool) -> int:
             if lparam == tray_context_menu_event:
                 try:
                     latest_quota_for_display(refresh=True)
-                    self.update_menu()
                 except Exception:
                     pass
+                self._show_context_menu()
+                return 0
             return super()._on_notify(wparam, lparam)
 
     def open_from_tray() -> None:
@@ -2372,17 +2896,105 @@ def run_server_with_tray(open_browser: bool) -> int:
     def on_bell(icon, item) -> None:
         trigger_test_alert()
 
+    def on_toggle_remote_control(icon, item) -> None:
+        status = cached_codex_remote_control_status()
+        if status.get("starting") or status.get("stopping"):
+            return
+
+        if status["running"]:
+            if not set_codex_remote_control_stopping():
+                return
+            icon.update_menu()
+
+            def _stop() -> None:
+                error = ""
+                try:
+                    stop_codex_remote_control()
+                    status = codex_remote_control_status()
+                except RuntimeError as exc:
+                    error = str(exc)
+                    status = {
+                        "available": bool(codex_cli_command()),
+                        "running": True,
+                        "pids": cached_codex_remote_control_status()["pids"],
+                        "error": error,
+                    }
+                store_codex_remote_control_status(status, finish_stopping=bool(error))
+                if error:
+                    try:
+                        icon.notify(safe_short(error, 180), CODEX_REMOTE_MENU_LABEL)
+                    except Exception:
+                        pass
+
+            run_daemon_thread(_stop)
+            return
+
+        def _notify_start_error(error: str) -> None:
+            try:
+                icon.notify(safe_short(error, 180), CODEX_REMOTE_MENU_LABEL)
+            except Exception:
+                pass
+
+        if not start_codex_remote_control_async(
+            check_running=False,
+            on_error=_notify_start_error,
+        ):
+            return
+        icon.update_menu()
+
+    def remote_control_text_value(status: dict) -> str:
+        if status.get("starting", False):
+            return f"{CODEX_REMOTE_MENU_LABEL} (Starting...)"
+        if status.get("stopping", False):
+            return f"{CODEX_REMOTE_MENU_LABEL} (Stopping...)"
+        if status.get("loading", False):
+            return f"{CODEX_REMOTE_MENU_LABEL} (Checking...)"
+        if status.get("error"):
+            return f"{CODEX_REMOTE_MENU_LABEL} (Check failed)"
+        if not status.get("available", False):
+            return f"{CODEX_REMOTE_MENU_LABEL} (CLI not found)"
+        return CODEX_REMOTE_MENU_LABEL
+
+    def remote_control_checked_value(status: dict) -> bool | None:
+        if (
+            status.get("starting", False)
+            or status.get("stopping", False)
+            or status.get("loading", False)
+            or status.get("error")
+            or not status.get("available", False)
+        ):
+            return None
+        return bool(status.get("running"))
+
+    def remote_control_enabled_value(status: dict) -> bool:
+        return (
+            not status.get("starting", False)
+            and not status.get("stopping", False)
+            and not status.get("loading", False)
+            and not status.get("error")
+            and status.get("available", False)
+        )
+
+    def remote_control_text(item) -> str:
+        return remote_control_text_value(cached_codex_remote_control_status())
+
+    def remote_control_checked(item) -> bool | None:
+        return remote_control_checked_value(cached_codex_remote_control_status())
+
+    def remote_control_enabled(item) -> bool:
+        return remote_control_enabled_value(cached_codex_remote_control_status())
+
     def on_toggle_startup(icon, item) -> None:
         try:
-            if has_startup_task():
+            if has_startup_task(startup_arguments):
                 uninstall_startup()
             else:
-                install_startup()
+                install_startup(startup_arguments)
         finally:
             icon.update_menu()
 
     def startup_checked(item) -> bool:
-        return has_startup_task()
+        return has_startup_task(startup_arguments)
 
     def on_exit(icon, item) -> None:
         exit_requested.set()
@@ -2394,16 +3006,25 @@ def run_server_with_tray(open_browser: bool) -> int:
             pystray.MenuItem(line, None, enabled=False)
             for line in tray_quota_display_lines(latest_quota_for_display(refresh=False))
         )
-        return (
+        remote_item = pystray.MenuItem(
+            remote_control_text,
+            on_toggle_remote_control,
+            checked=remote_control_checked,
+            enabled=remote_control_enabled,
+        )
+        items = (
             pystray.MenuItem("Open Dashboard", on_open_dashboard, default=True),
             pystray.Menu.SEPARATOR,
             *quota_items,
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Test Alert", on_bell),
+            remote_item,
             pystray.MenuItem("Start at Logon", on_toggle_startup, checked=startup_checked),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Exit", on_exit),
         )
+        remote_menu_item_id["value"] = items.index(remote_item) + 1
+        return items
 
     icon = DashboardTrayIcon(
         APP_NAME,
@@ -2413,6 +3034,14 @@ def run_server_with_tray(open_browser: bool) -> int:
         tray_activate=on_open_dashboard,
         menu=pystray.Menu(build_tray_menu),
     )
+    if start_remote_control:
+        def _notify_auto_start_error(error: str) -> None:
+            try:
+                icon.notify(safe_short(error, 180), CODEX_REMOTE_MENU_LABEL)
+            except Exception:
+                pass
+
+        start_codex_remote_control_async(on_error=_notify_auto_start_error)
 
     attention_stop = threading.Event()
     attention_thread = threading.Thread(
@@ -2436,12 +3065,8 @@ def run_server_with_tray(open_browser: bool) -> int:
 
 
 def main() -> int:
+    command_arguments = sys.argv[1:]
     parser = argparse.ArgumentParser(description="Codex Dashboard")
-    parser.add_argument(
-        "--serve",
-        action="store_true",
-        help="run the dashboard server",
-    )
     parser.add_argument(
         "--install-startup",
         action="store_true",
@@ -2467,10 +3092,15 @@ def main() -> int:
         action="store_true",
         help="show a Windows notification-area icon while serving",
     )
+    parser.add_argument(
+        "--start-remote-control",
+        action="store_true",
+        help="start codex remote-control in the background when the dashboard starts",
+    )
     args = parser.parse_args()
 
     if args.install_startup:
-        install_startup()
+        install_startup(command_arguments)
         print(f"Installed startup task: {STARTUP_TASK_NAME}")
         return 0
 
@@ -2480,13 +3110,17 @@ def main() -> int:
         return 0
 
     if args.startup_status:
-        print(startup_status())
+        print(startup_status(command_arguments))
         return 0
 
     if args.tray:
-        return run_server_with_tray(args.open_browser)
+        return run_server_with_tray(
+            args.open_browser,
+            args.start_remote_control,
+            startup_arguments=command_arguments,
+        )
 
-    return run_server_blocking(args.open_browser)
+    return run_server_blocking(args.open_browser, args.start_remote_control)
 
 
 if __name__ == "__main__":

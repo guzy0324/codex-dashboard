@@ -18,6 +18,7 @@ Codex Dashboard 是一个面向 OpenAI Codex hooks 的本地 Flask 小面板。�
 - 在页面顶部显示权限请求。
 - 可用时让 dashboard 浏览器窗口的 Windows 任务栏按钮闪烁。
 - 在 tray 模式下，Windows 通知区域图标会闪烁，并显示托盘通知弹窗。
+- 在 tray 右键菜单中监测、启动和关闭 `codex remote-control`。
 - 支持带机器名前缀的路径，例如 `gpu01:/mdata/project`。
 
 ## 环境要求
@@ -26,6 +27,7 @@ Codex Dashboard 是一个面向 OpenAI Codex hooks 的本地 Flask 小面板。�
 - Flask
 - 如果需要 Windows 通知区域图标，需要安装 pystray 和 Pillow
 - 运行 Codex hooks 的 shell 中需要有 `curl`
+- 如果需要从托盘启停或自动启动 Remote Control，需要本机可执行 `codex remote-control`
 
 如有需要，安装 Flask：
 
@@ -54,7 +56,13 @@ http://127.0.0.1:18765
 在 Windows 上使用通知区域图标运行：
 
 ```powershell
-python codex_dashboard.py --serve --tray
+python codex_dashboard.py --tray
+```
+
+如果希望 dashboard 启动时同时在后台启动 Codex Remote Control：
+
+```powershell
+python codex_dashboard.py --tray --start-remote-control
 ```
 
 如果 Codex 运行在 WSL 或远程主机上，请把 dashboard 运行在 hook 命令可以访问 `127.0.0.1:18765` 的同一个环境中。
@@ -64,18 +72,30 @@ python codex_dashboard.py --serve --tray
 在 Windows 上，可以注册一个当前用户的计划任务，让 dashboard 在登录后自动启动并在时钟附近显示通知区域图标：
 
 ```powershell
-python codex_dashboard.py --install-startup
+python codex_dashboard.py --install-startup --tray
 ```
 
-该任务会延迟 20 秒启动，避开登录阶段的高负载；允许在使用电池时运行，并在进程异常退出时最多重启 3 次。由于托盘图标依赖用户桌面会话，此处使用“用户登录”触发而不是系统启动触发。
+如果希望登录启动 dashboard 时也自动启动 Codex Remote Control：
+
+```powershell
+python codex_dashboard.py --install-startup --tray --start-remote-control
+```
+
+该任务会延迟 20 秒启动，避开登录阶段的高负载；允许在使用电池时运行，并在进程异常退出时最多重启 3 次。由于托盘图标依赖用户桌面会话，此处使用“用户登录”触发而不是系统启动触发。一次性管理参数 `--install-startup`、`--uninstall-startup` 和 `--startup-status` 不会写入任务动作；其余传入参数会原样保留，例如 `--tray`、`--open-browser` 和 `--start-remote-control`。
 
 检查计划任务状态：
 
 ```powershell
-python codex_dashboard.py --startup-status
+python codex_dashboard.py --startup-status --tray
 ```
 
-输出为 `installed` 时任务已配置且与当前脚本位置匹配；输出为 `outdated` 或 `disabled` 时，重新执行 `--install-startup` 即可修复配置。
+如需检查带 Remote Control 自动启动配置的任务：
+
+```powershell
+python codex_dashboard.py --startup-status --tray --start-remote-control
+```
+
+输出为 `installed` 时任务已配置且与所传选项匹配；输出为 `outdated` 或 `disabled` 时，使用所需选项重新执行 `--install-startup` 即可修复配置。
 
 移除开机自启任务：
 
@@ -83,13 +103,21 @@ python codex_dashboard.py --startup-status
 python codex_dashboard.py --uninstall-startup
 ```
 
-计划任务会使用当前 Python 解释器，并执行：
+使用第一个安装示例时，计划任务会使用当前 Python 解释器并执行：
 
 ```text
-pythonw codex_dashboard.py --serve --tray
+pythonw codex_dashboard.py --tray
 ```
 
-托盘悬停提示和右键菜单会显示最近一次已知 Codex 用量。托盘菜单还包含 Open Dashboard、Test Alert、Start at Logon 和 Exit。
+使用带 `--start-remote-control` 的安装示例时执行：
+
+```text
+pythonw codex_dashboard.py --tray --start-remote-control
+```
+
+托盘悬停提示和右键菜单会显示最近一次已知 Codex 用量。托盘菜单还包含 Open Dashboard、Test Alert、Codex Remote Control、Start at Logon 和 Exit。
+
+`Codex Remote Control` 菜单项会在检测到 `codex remote-control` 正在运行时显示勾选。每次打开右键菜单时，该项会先显示 `Checking...` 并在后台检测，完成后直接更新当前已打开菜单中的勾选状态；如果提前关闭菜单，未完成的检测会被取消。未勾选时点击该项会在后台执行跨平台命令 `codex remote-control`，并在启动确认期间显示禁用的 `Starting...`，避免服务尚未出现时被重复启动；已勾选时再次点击会在后台关闭 Remote Control，并在确认停止期间显示禁用的 `Stopping...`。Windows 上该后台进程仍使用无控制台窗口的创建标志。如需覆盖用于启动的 Codex CLI 路径，可以设置环境变量 `CODEX_DASHBOARD_CODEX_CMD`。
 
 ## Codex Hook 配置
 

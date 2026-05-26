@@ -20,6 +20,7 @@ The dashboard is intentionally in-memory. Restarting the server clears the page.
 - Shows permission requests at the top of the page.
 - Flashes the Windows taskbar button for the dashboard browser window when possible.
 - Flashes the Windows tray icon and shows a tray notification popup in tray mode.
+- Monitors, starts, and stops `codex remote-control` from the tray context menu.
 - Supports machine-prefixed paths, for example `gpu01:/mdata/project`.
 
 ## Requirements
@@ -28,6 +29,7 @@ The dashboard is intentionally in-memory. Restarting the server clears the page.
 - Flask
 - pystray and Pillow if you want the Windows notification-area icon
 - `curl` available in the shell running Codex hooks
+- a working `codex remote-control` command to toggle or automatically start Remote Control
 
 Install Flask if needed:
 
@@ -56,7 +58,13 @@ http://127.0.0.1:18765
 On Windows, run with a notification-area icon:
 
 ```powershell
-python codex_dashboard.py --serve --tray
+python codex_dashboard.py --tray
+```
+
+To also start Codex Remote Control in the background when the dashboard starts:
+
+```powershell
+python codex_dashboard.py --tray --start-remote-control
 ```
 
 If Codex runs in WSL or on a remote host, run this dashboard in the same
@@ -69,22 +77,37 @@ logon. It starts the server in the background and shows a Windows
 notification-area icon near the clock:
 
 ```powershell
-python codex_dashboard.py --install-startup
+python codex_dashboard.py --install-startup --tray
+```
+
+To start Codex Remote Control as part of the registered logon task:
+
+```powershell
+python codex_dashboard.py --install-startup --tray --start-remote-control
 ```
 
 The task waits 20 seconds to avoid logon contention, runs while on battery
 power, and retries up to three times if the process exits unexpectedly. It is
 triggered at user logon rather than system boot because the tray icon requires
-an interactive desktop session.
+an interactive desktop session. The one-time management options
+`--install-startup`, `--uninstall-startup`, and `--startup-status` are omitted
+from the task action; all other supplied options are retained, including
+`--tray`, `--open-browser`, and `--start-remote-control`.
 
 Check the task state:
 
 ```powershell
-python codex_dashboard.py --startup-status
+python codex_dashboard.py --startup-status --tray
 ```
 
-`installed` means the task is enabled and matches the current script path. For
-`outdated` or `disabled`, run `--install-startup` again to repair it.
+To check a task configured to auto-start Remote Control:
+
+```powershell
+python codex_dashboard.py --startup-status --tray --start-remote-control
+```
+
+`installed` means the task is enabled and matches the supplied options. For
+`outdated` or `disabled`, run `--install-startup` again with the wanted options.
 
 Remove the startup task:
 
@@ -92,14 +115,36 @@ Remove the startup task:
 python codex_dashboard.py --uninstall-startup
 ```
 
-The task uses the current Python interpreter and runs:
+Using the first installation example, the task uses the current Python
+interpreter and runs:
 
 ```text
-pythonw codex_dashboard.py --serve --tray
+pythonw codex_dashboard.py --tray
+```
+
+Using the installation example with `--start-remote-control`, it runs:
+
+```text
+pythonw codex_dashboard.py --tray --start-remote-control
 ```
 
 The tray tooltip and right-click menu show the latest known Codex usage. The
-tray menu also includes Open Dashboard, Test Alert, Startup, and Exit.
+tray menu also includes Open Dashboard, Test Alert, Codex Remote Control,
+Start at Logon, and Exit.
+
+`Codex Remote Control` is checked while a running `codex remote-control`
+process is detected. Each time the context menu opens, the item first displays
+`Checking...`, runs the probe in the background, and updates the currently open
+menu when the result arrives. Closing the menu cancels an unfinished probe.
+Launching also runs in the background, so it does not block the tray menu.
+Click the unchecked item to start Remote Control; the item stays disabled as
+`Starting...` until startup is confirmed or its grace period expires, avoiding
+duplicate launches while the process is still appearing. Click the checked
+item again to stop Remote Control in the background; it remains disabled as
+`Stopping...` until shutdown is confirmed or its grace period expires.
+Background startup invokes the cross-platform `codex remote-control` command;
+Windows still uses no-console process creation flags. Set
+`CODEX_DASHBOARD_CODEX_CMD` to override the Codex CLI command used for launching.
 
 ## Codex Hook Config
 
