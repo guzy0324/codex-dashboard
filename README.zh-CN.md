@@ -163,6 +163,101 @@ statusMessage = "Dashboard: done"
 command = "curl -fsS --max-time 2 -X POST -H 'Content-Type: application/json' -H \"X-Codex-Machine: ${HOSTNAME:-local}\" --data-binary @- http://127.0.0.1:18765/api/codex/user_prompt_submit >/dev/null 2>&1 || true"
 ```
 
+### 远程主机的 quota
+
+如果 dashboard 运行在 Windows 本机，而 Codex 运行在远程 Linux 主机上，普通 `curl --data-binary @-` hook 只能把远程 transcript 路径发给 dashboard。Windows 不能直接读取 `/mdata/.../.codex/sessions/...jsonl`，所以远程会话可能没有 quota。
+
+这种情况下，在远程主机放一个 helper，例如 `/mdata/guzy0324/.codex/dashboard_hook.py`，由 helper 在远程读取 transcript 里的最新 `rate_limits` 后再转发给 dashboard：
+
+```python
+#!/usr/bin/env python3
+import json
+import os
+import subprocess
+import sys
+import time
+
+endpoint = sys.argv[1]
+machine = sys.argv[2]
+dashboard = os.environ.get("CODEX_DASHBOARD_URL", "http://127.0.0.1:18765").rstrip("/")
+
+payload = json.loads(sys.stdin.read() or "{}")
+transcript = payload.get("transcript_path") or ""
+
+
+def read_latest_rate_limits(path):
+    if not path or not os.path.isfile(path):
+        return None
+
+    size = os.path.getsize(path)
+    with open(path, "rb") as f:
+        if size > 1024 * 1024:
+            f.seek(-1024 * 1024, os.SEEK_END)
+        lines = f.read().decode("utf-8", "replace").splitlines()
+
+    latest = None
+    for line in lines:
+        try:
+            item = json.loads(line)
+        except Exception:
+            continue
+
+        payload = item.get("payload") if item.get("type") == "event_msg" else None
+        if isinstance(payload, dict) and isinstance(payload.get("rate_limits"), dict):
+            latest = payload["rate_limits"]
+
+    return latest
+
+
+rate_limits = None
+for _ in range(6 if endpoint == "stop" else 1):
+    rate_limits = read_latest_rate_limits(transcript)
+    if rate_limits:
+        break
+    time.sleep(0.15)
+
+if rate_limits:
+    payload["rate_limits"] = rate_limits
+
+subprocess.run(
+    [
+        "curl",
+        "-fsS",
+        "--max-time",
+        "2",
+        "-H",
+        "Content-Type: application/json",
+        "-H",
+        f"X-Codex-Machine: {machine}",
+        "--data-binary",
+        "@-",
+        f"{dashboard}/api/codex/{endpoint}",
+    ],
+    input=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+)
+
+if endpoint == "stop":
+    print('{"continue":true}')
+```
+
+然后把远程 Codex config 里的三条 hook command 改成：
+
+```toml
+command = "python3 /mdata/guzy0324/.codex/dashboard_hook.py user_prompt_submit labgpu"
+```
+
+```toml
+command = "python3 /mdata/guzy0324/.codex/dashboard_hook.py permission_request labgpu"
+```
+
+```toml
+command = "python3 /mdata/guzy0324/.codex/dashboard_hook.py stop labgpu"
+```
+
+如果远程的 `127.0.0.1:18765` 不能访问本机 dashboard，可以设置 `CODEX_DASHBOARD_URL`，或者用 SSH 反向端口转发，例如 `ssh -R 18765:127.0.0.1:18765 labgpu`。修改 hook command 后，Codex 会要求重新信任新的 hook hash。
+
 ### Windows PowerShell
 
 在 Windows 上请显式使用 `curl.exe`，避免 PowerShell 把 `curl` 解析为别名。把 `gpu01` 替换为你希望显示的名称。

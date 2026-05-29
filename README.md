@@ -193,6 +193,111 @@ the command:
 command = "curl -fsS --max-time 2 -X POST -H 'Content-Type: application/json' -H \"X-Codex-Machine: ${HOSTNAME:-local}\" --data-binary @- http://127.0.0.1:18765/api/codex/user_prompt_submit >/dev/null 2>&1 || true"
 ```
 
+### Remote Host Quota
+
+If the dashboard runs on a Windows workstation while Codex runs on a remote
+Linux host, a plain `curl --data-binary @-` hook only sends the remote
+transcript path to the dashboard. Windows cannot read a path such as
+`/mdata/.../.codex/sessions/...jsonl`, so remote conversations may not show
+quota.
+
+In that setup, put a helper on the remote host, for example
+`/mdata/guzy0324/.codex/dashboard_hook.py`. The helper reads the latest
+`rate_limits` from the remote transcript and forwards the enriched payload to
+the dashboard:
+
+```python
+#!/usr/bin/env python3
+import json
+import os
+import subprocess
+import sys
+import time
+
+endpoint = sys.argv[1]
+machine = sys.argv[2]
+dashboard = os.environ.get("CODEX_DASHBOARD_URL", "http://127.0.0.1:18765").rstrip("/")
+
+payload = json.loads(sys.stdin.read() or "{}")
+transcript = payload.get("transcript_path") or ""
+
+
+def read_latest_rate_limits(path):
+    if not path or not os.path.isfile(path):
+        return None
+
+    size = os.path.getsize(path)
+    with open(path, "rb") as f:
+        if size > 1024 * 1024:
+            f.seek(-1024 * 1024, os.SEEK_END)
+        lines = f.read().decode("utf-8", "replace").splitlines()
+
+    latest = None
+    for line in lines:
+        try:
+            item = json.loads(line)
+        except Exception:
+            continue
+
+        payload = item.get("payload") if item.get("type") == "event_msg" else None
+        if isinstance(payload, dict) and isinstance(payload.get("rate_limits"), dict):
+            latest = payload["rate_limits"]
+
+    return latest
+
+
+rate_limits = None
+for _ in range(6 if endpoint == "stop" else 1):
+    rate_limits = read_latest_rate_limits(transcript)
+    if rate_limits:
+        break
+    time.sleep(0.15)
+
+if rate_limits:
+    payload["rate_limits"] = rate_limits
+
+subprocess.run(
+    [
+        "curl",
+        "-fsS",
+        "--max-time",
+        "2",
+        "-H",
+        "Content-Type: application/json",
+        "-H",
+        f"X-Codex-Machine: {machine}",
+        "--data-binary",
+        "@-",
+        f"{dashboard}/api/codex/{endpoint}",
+    ],
+    input=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+)
+
+if endpoint == "stop":
+    print('{"continue":true}')
+```
+
+Then change the three remote hook commands to:
+
+```toml
+command = "python3 /mdata/guzy0324/.codex/dashboard_hook.py user_prompt_submit labgpu"
+```
+
+```toml
+command = "python3 /mdata/guzy0324/.codex/dashboard_hook.py permission_request labgpu"
+```
+
+```toml
+command = "python3 /mdata/guzy0324/.codex/dashboard_hook.py stop labgpu"
+```
+
+If remote `127.0.0.1:18765` cannot reach the local dashboard, set
+`CODEX_DASHBOARD_URL` or use SSH reverse forwarding, for example
+`ssh -R 18765:127.0.0.1:18765 labgpu`. After changing hook commands, Codex will
+ask you to trust the new hook hashes.
+
 ### Windows PowerShell
 
 Use `curl.exe` explicitly on Windows so PowerShell does not resolve `curl` as an
