@@ -5,8 +5,8 @@ import json
 import locale
 import os
 import platform
-import signal
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -15,7 +15,8 @@ import time
 import webbrowser
 import xml.etree.ElementTree as ET
 from datetime import datetime
-from flask import Flask, request, jsonify, Response
+
+from flask import Flask, Response, jsonify, request
 from werkzeug.serving import make_server
 
 APP_NAME = "Codex Dashboard"
@@ -24,11 +25,13 @@ PORT = 18765
 DASHBOARD_URL = f"http://{HOST}:{PORT}"
 STARTUP_TASK_NAME = r"\Codex Dashboard"
 STARTUP_TASK_DELAY = "PT20S"
-STARTUP_CONTROL_ARGUMENTS = frozenset({
-    "--install-startup",
-    "--uninstall-startup",
-    "--startup-status",
-})
+STARTUP_CONTROL_ARGUMENTS = frozenset(
+    {
+        "--install-startup",
+        "--uninstall-startup",
+        "--startup-status",
+    }
+)
 TASK_XML_NAMESPACE = "http://schemas.microsoft.com/windows/2004/02/mit/task"
 MAX_ALERTS = 20
 VSCODE_CODEX_SIDEBAR_COMMAND = "chatgpt.openSidebar"
@@ -153,7 +156,9 @@ def set_dashboard_taskbar_flash(stop: bool = False) -> None:
             user32.GetWindowTextW(hwnd, buffer, length + 1)
             return buffer.value
 
-        enum_proc_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
+        enum_proc_type = ctypes.WINFUNCTYPE(
+            wintypes.BOOL, wintypes.HWND, wintypes.LPARAM
+        )
 
         def enum_proc(hwnd, lparam):
             if not user32.IsWindowVisible(hwnd):
@@ -251,7 +256,9 @@ def process_error(result: subprocess.CompletedProcess[bytes]) -> str:
 def current_windows_user_sid() -> str:
     result = run_windows_process(["whoami.exe", "/user", "/fo", "csv", "/nh"])
     if result.returncode != 0:
-        raise RuntimeError(f"Unable to determine the current Windows user: {process_error(result)}")
+        raise RuntimeError(
+            f"Unable to determine the current Windows user: {process_error(result)}"
+        )
 
     text = decode_windows_output(result.stdout).lstrip("\ufeff").strip()
     try:
@@ -263,7 +270,9 @@ def current_windows_user_sid() -> str:
     return row[1].strip()
 
 
-def task_xml_element(parent: ET.Element, name: str, text: str | None = None) -> ET.Element:
+def task_xml_element(
+    parent: ET.Element, name: str, text: str | None = None
+) -> ET.Element:
     element = ET.SubElement(parent, f"{{{TASK_XML_NAMESPACE}}}{name}")
     if text is not None:
         element.text = text
@@ -279,7 +288,9 @@ def build_startup_task_xml(
     command, action_arguments, working_directory = startup_action(arguments)
 
     registration_info = task_xml_element(task, "RegistrationInfo")
-    task_xml_element(registration_info, "Description", "Start Codex Dashboard at user logon.")
+    task_xml_element(
+        registration_info, "Description", "Start Codex Dashboard at user logon."
+    )
 
     triggers = task_xml_element(task, "Triggers")
     logon_trigger = task_xml_element(triggers, "LogonTrigger")
@@ -317,22 +328,30 @@ def build_startup_task_xml(
 
 
 def query_startup_task() -> ET.Element | None:
-    result = run_windows_process(["schtasks.exe", "/Query", "/TN", STARTUP_TASK_NAME, "/XML"])
+    result = run_windows_process(
+        ["schtasks.exe", "/Query", "/TN", STARTUP_TASK_NAME, "/XML"]
+    )
     if result.returncode != 0:
         return None
     try:
         return ET.fromstring(decode_windows_output(result.stdout))
     except ET.ParseError as exc:
-        raise RuntimeError("Windows returned an invalid startup task definition") from exc
+        raise RuntimeError(
+            "Windows returned an invalid startup task definition"
+        ) from exc
 
 
 def install_startup(arguments: list[str] | None = None) -> None:
     if not is_windows():
-        raise RuntimeError("Startup installation is currently only supported on Windows")
+        raise RuntimeError(
+            "Startup installation is currently only supported on Windows"
+        )
 
     task_path = ""
     try:
-        with tempfile.NamedTemporaryFile(prefix="codex-dashboard-", suffix=".xml", delete=False) as task_file:
+        with tempfile.NamedTemporaryFile(
+            prefix="codex-dashboard-", suffix=".xml", delete=False
+        ) as task_file:
             task_file.write(
                 build_startup_task_xml(
                     current_windows_user_sid(),
@@ -341,10 +360,20 @@ def install_startup(arguments: list[str] | None = None) -> None:
             )
             task_path = task_file.name
         result = run_windows_process(
-            ["schtasks.exe", "/Create", "/TN", STARTUP_TASK_NAME, "/XML", task_path, "/F"]
+            [
+                "schtasks.exe",
+                "/Create",
+                "/TN",
+                STARTUP_TASK_NAME,
+                "/XML",
+                task_path,
+                "/F",
+            ]
         )
         if result.returncode != 0:
-            raise RuntimeError(f"Unable to register the startup task: {process_error(result)}")
+            raise RuntimeError(
+                f"Unable to register the startup task: {process_error(result)}"
+            )
     finally:
         if task_path and os.path.exists(task_path):
             os.remove(task_path)
@@ -352,12 +381,18 @@ def install_startup(arguments: list[str] | None = None) -> None:
 
 def uninstall_startup() -> None:
     if not is_windows():
-        raise RuntimeError("Startup uninstallation is currently only supported on Windows")
+        raise RuntimeError(
+            "Startup uninstallation is currently only supported on Windows"
+        )
 
     if query_startup_task() is not None:
-        result = run_windows_process(["schtasks.exe", "/Delete", "/TN", STARTUP_TASK_NAME, "/F"])
+        result = run_windows_process(
+            ["schtasks.exe", "/Delete", "/TN", STARTUP_TASK_NAME, "/F"]
+        )
         if result.returncode != 0 and query_startup_task() is not None:
-            raise RuntimeError(f"Unable to remove the startup task: {process_error(result)}")
+            raise RuntimeError(
+                f"Unable to remove the startup task: {process_error(result)}"
+            )
 
 
 def startup_status(arguments: list[str] | None = None) -> str:
@@ -375,7 +410,8 @@ def startup_status(arguments: list[str] | None = None) -> str:
     command, expected_arguments, working_directory = startup_action(arguments)
     installed_action = (
         action is not None
-        and os.path.normcase(action.findtext("task:Command", "", namespace)) == os.path.normcase(command)
+        and os.path.normcase(action.findtext("task:Command", "", namespace))
+        == os.path.normcase(command)
         and action.findtext("task:Arguments", "", namespace) == expected_arguments
         and os.path.normcase(action.findtext("task:WorkingDirectory", "", namespace))
         == os.path.normcase(working_directory)
@@ -399,7 +435,9 @@ def codex_cli_command() -> str | None:
     return "codex" if shutil.which("codex") else None
 
 
-def cancellable_communicate(process: subprocess.Popen, cancel_event: threading.Event | None):
+def cancellable_communicate(
+    process: subprocess.Popen, cancel_event: threading.Event | None
+):
     if cancel_event is None:
         return process.communicate()
 
@@ -428,7 +466,13 @@ def process_rows(cancel_event: threading.Event | None = None) -> list[dict]:
             """Get-CimInstance Win32_Process -Filter "Name='codex.exe' OR Name='node.exe'" | """
             "Select-Object ProcessId,Name,CommandLine | ConvertTo-Json -Compress"
         )
-        arguments = ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script]
+        arguments = [
+            "powershell.exe",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            script,
+        ]
         try:
             process = subprocess.Popen(
                 arguments,
@@ -440,7 +484,9 @@ def process_rows(cancel_event: threading.Event | None = None) -> list[dict]:
             raise RuntimeError(f"Unable to run {arguments[0]}: {exc}") from exc
 
         stdout, stderr = cancellable_communicate(process, cancel_event)
-        result = subprocess.CompletedProcess(arguments, process.returncode, stdout, stderr)
+        result = subprocess.CompletedProcess(
+            arguments, process.returncode, stdout, stderr
+        )
         if result.returncode != 0:
             raise RuntimeError(f"Unable to inspect processes: {process_error(result)}")
 
@@ -450,7 +496,9 @@ def process_rows(cancel_event: threading.Event | None = None) -> list[dict]:
         try:
             rows = json.loads(text)
         except ValueError as exc:
-            raise RuntimeError("Unable to inspect processes: invalid Windows process data") from exc
+            raise RuntimeError(
+                "Unable to inspect processes: invalid Windows process data"
+            ) from exc
         return rows if isinstance(rows, list) else [rows]
 
     try:
@@ -471,18 +519,23 @@ def process_rows(cancel_event: threading.Event | None = None) -> list[dict]:
     )
     if result.returncode != 0:
         detail = (result.stderr or "").strip()
-        raise RuntimeError(detail or f"Unable to inspect processes: ps exited with status {result.returncode}")
+        raise RuntimeError(
+            detail
+            or f"Unable to inspect processes: ps exited with status {result.returncode}"
+        )
 
     rows = []
     for line in (result.stdout or "").splitlines():
         fields = line.strip().split(None, 2)
         if len(fields) < 2:
             continue
-        rows.append({
-            "ProcessId": fields[0],
-            "Name": fields[1],
-            "CommandLine": fields[2] if len(fields) > 2 else fields[1],
-        })
+        rows.append(
+            {
+                "ProcessId": fields[0],
+                "Name": fields[1],
+                "CommandLine": fields[2] if len(fields) > 2 else fields[1],
+            }
+        )
     return rows
 
 
@@ -493,9 +546,8 @@ def is_codex_remote_control_process(row: dict) -> bool:
         return False
     if process_name in ("codex", "codex.exe"):
         return True
-    return (
-        process_name in ("node", "node.exe")
-        and ("codex.js" in command_line or "@openai/codex" in command_line.replace("\\", "/"))
+    return process_name in ("node", "node.exe") and (
+        "codex.js" in command_line or "@openai/codex" in command_line.replace("\\", "/")
     )
 
 
@@ -570,25 +622,23 @@ def store_codex_remote_control_status(
         if not running or finish_stopping:
             stopping = False
 
-        REMOTE_CONTROL_STATUS_CACHE.update({
-            "available": bool(status.get("available")),
-            "running": running,
-            "pids": list(status.get("pids") or []),
-            "error": str(status.get("error") or ""),
-            "loading": False,
-            "starting": starting,
-            "starting_until": (
-                REMOTE_CONTROL_STATUS_CACHE["starting_until"]
-                if starting
-                else 0.0
-            ),
-            "stopping": stopping,
-            "stopping_until": (
-                REMOTE_CONTROL_STATUS_CACHE["stopping_until"]
-                if stopping
-                else 0.0
-            ),
-        })
+        REMOTE_CONTROL_STATUS_CACHE.update(
+            {
+                "available": bool(status.get("available")),
+                "running": running,
+                "pids": list(status.get("pids") or []),
+                "error": str(status.get("error") or ""),
+                "loading": False,
+                "starting": starting,
+                "starting_until": (
+                    REMOTE_CONTROL_STATUS_CACHE["starting_until"] if starting else 0.0
+                ),
+                "stopping": stopping,
+                "stopping_until": (
+                    REMOTE_CONTROL_STATUS_CACHE["stopping_until"] if stopping else 0.0
+                ),
+            }
+        )
         stored = REMOTE_CONTROL_STATUS_CACHE.copy()
         stored["pids"] = list(REMOTE_CONTROL_STATUS_CACHE["pids"])
         return stored
@@ -711,7 +761,9 @@ def stop_codex_remote_control() -> None:
             except ProcessLookupError:
                 continue
             except OSError as exc:
-                raise RuntimeError(f"Unable to stop Codex Remote Control: {exc}") from exc
+                raise RuntimeError(
+                    f"Unable to stop Codex Remote Control: {exc}"
+                ) from exc
 
 
 def start_codex_remote_control_async(
@@ -781,7 +833,12 @@ def display_path(machine: str | None, cwd: str | None) -> str:
 
 
 def is_windows_drive_path(path: str) -> bool:
-    return len(path) >= 3 and path[0].isalpha() and path[1] == ":" and path[2] in ("\\", "/")
+    return (
+        len(path) >= 3
+        and path[0].isalpha()
+        and path[1] == ":"
+        and path[2] in ("\\", "/")
+    )
 
 
 def is_windows_unc_path(path: str) -> bool:
@@ -853,7 +910,9 @@ def open_vscode_path(machine: str | None, cwd: str | None) -> tuple[dict, int]:
         "stderr": subprocess.DEVNULL,
     }
     if is_windows():
-        kwargs["creationflags"] = subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+        kwargs["creationflags"] = (
+            subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.DETACHED_PROCESS
+        )
 
     try:
         subprocess.Popen(args, **kwargs)
@@ -1207,7 +1266,9 @@ def normalize_rate_limit_window(window_key: str, window: dict) -> dict | None:
     }
 
 
-def quota_summary_from_rate_limits(rate_limits: dict | None, event_ts: float | None) -> dict:
+def quota_summary_from_rate_limits(
+    rate_limits: dict | None, event_ts: float | None
+) -> dict:
     if not isinstance(rate_limits, dict):
         return {}
 
@@ -1375,7 +1436,9 @@ def refresh_rate_limits() -> None:
     updates = []
     for session_id, transcript_path in candidates:
         if transcript_path not in quota_by_path:
-            quota_by_path[transcript_path] = cached_latest_quota_summary(transcript_path)
+            quota_by_path[transcript_path] = cached_latest_quota_summary(
+                transcript_path
+            )
 
         quota = quota_by_path[transcript_path]
         if quota:
@@ -1404,11 +1467,7 @@ def copy_quota_summary(quota: dict | None) -> dict:
     if not isinstance(quota, dict):
         return {}
 
-    copied = {
-        key: value
-        for key, value in quota.items()
-        if key != "windows"
-    }
+    copied = {key: value for key, value in quota.items() if key != "windows"}
     copied["windows"] = [
         window.copy()
         for window in quota.get("windows") or []
@@ -1474,12 +1533,14 @@ def refresh_interrupted_turns() -> None:
                 continue
 
             completed_at = event.get("completed_at") or now_ts()
-            row.update({
-                "status": "interrupted",
-                "updated_at": max(row.get("updated_at") or 0, completed_at),
-                "finished_at": completed_at,
-                "permission": None,
-            })
+            row.update(
+                {
+                    "status": "interrupted",
+                    "updated_at": max(row.get("updated_at") or 0, completed_at),
+                    "finished_at": completed_at,
+                    "permission": None,
+                }
+            )
 
 
 def conversation_key(item: dict) -> str:
@@ -1563,9 +1624,7 @@ def merge_item(group: dict, item: dict) -> None:
     if isinstance(item_quota, dict):
         group_quota = group.get("quota")
         group_quota_updated_at = (
-            group_quota.get("updated_at_raw")
-            if isinstance(group_quota, dict)
-            else 0
+            group_quota.get("updated_at_raw") if isinstance(group_quota, dict) else 0
         ) or 0
         if item_quota.get("updated_at_raw", 0) >= group_quota_updated_at:
             group["quota"] = item_quota
@@ -1802,15 +1861,17 @@ def permission_request():
             alert["cwd"] = alert.get("cwd") or row.get("cwd") or ""
             alert["display_cwd"] = display_path(alert.get("machine"), alert.get("cwd"))
             alert["model"] = alert.get("model") or row.get("model") or ""
-            row.update({
-                "status": "permission",
-                "current_turn_id": turn_id or row.get("current_turn_id") or "",
-                "machine": alert.get("machine") or row.get("machine") or "",
-                "cwd": alert.get("cwd") or row.get("cwd") or "",
-                "model": alert.get("model") or row.get("model") or "",
-                "updated_at": alert["created_at_raw"],
-                "permission": alert,
-            })
+            row.update(
+                {
+                    "status": "permission",
+                    "current_turn_id": turn_id or row.get("current_turn_id") or "",
+                    "machine": alert.get("machine") or row.get("machine") or "",
+                    "cwd": alert.get("cwd") or row.get("cwd") or "",
+                    "model": alert.get("model") or row.get("model") or "",
+                    "updated_at": alert["created_at_raw"],
+                    "permission": alert,
+                }
+            )
         else:
             CONVERSATIONS[session_id] = {
                 "session_id": session_id,
@@ -2566,7 +2627,7 @@ def truncate_tray_tooltip_lines(lines: list[str], limit: int = 120) -> str:
         if len(text) > remaining:
             if kept and remaining < 24:
                 break
-            text = text[:remaining] if remaining <= 3 else text[:remaining - 3] + "..."
+            text = text[:remaining] if remaining <= 3 else text[: remaining - 3] + "..."
         kept.append(text)
         used += separator + len(text)
         if len(text) < len(original):
@@ -2584,7 +2645,7 @@ def tray_hover_title(attention: dict, quota: dict) -> str:
     if attention.get("active"):
         title = tray_attention_title(attention)
         prefix = f"{APP_NAME}: "
-        attention_part = title[len(prefix):] if title.startswith(prefix) else title
+        attention_part = title[len(prefix) :] if title.startswith(prefix) else title
         if attention_part and attention_part != APP_NAME:
             lines.append(safe_short(attention_part, 60))
 
@@ -2610,7 +2671,9 @@ def notify_tray_attention(icon, attention: dict) -> None:
         pass
 
 
-def run_tray_attention_loop(icon, tray_images: dict, stop_event: threading.Event) -> None:
+def run_tray_attention_loop(
+    icon, tray_images: dict, stop_event: threading.Event
+) -> None:
     blink_on = False
     last_attention_id = ""
     last_image_key = ""
@@ -2694,7 +2757,9 @@ def run_server_with_tray(
     startup_arguments: list[str] | None = None,
 ) -> int:
     if not is_windows():
-        print("Tray mode is currently only supported on Windows; falling back to normal service mode.")
+        print(
+            "Tray mode is currently only supported on Windows; falling back to normal service mode."
+        )
         return run_server_blocking(open_browser, start_remote_control)
 
     try:
@@ -2703,6 +2768,7 @@ def run_server_with_tray(
 
         import pystray
         from pystray._util import win32 as pystray_win32
+
         tray_images = create_tray_images()
         tray_image = tray_images["idle"]
     except ImportError:
@@ -2741,7 +2807,9 @@ def run_server_with_tray(
     draw_menu_bar.restype = wintypes.BOOL
 
     class DashboardTrayIcon(pystray.Icon):
-        def __init__(self, *args, notification_click=None, tray_activate=None, **kwargs):
+        def __init__(
+            self, *args, notification_click=None, tray_activate=None, **kwargs
+        ):
             self._notification_click = notification_click
             self._tray_activate = tray_activate
             self._last_tray_open_at = 0.0
@@ -2775,9 +2843,7 @@ def run_server_with_tray(
 
             checked = remote_control_checked_value(status)
             state = (
-                pystray_win32.MFS_CHECKED
-                if checked
-                else pystray_win32.MFS_UNCHECKED
+                pystray_win32.MFS_CHECKED if checked else pystray_win32.MFS_UNCHECKED
             )
             if not remote_control_enabled_value(status):
                 state |= pystray_win32.MFS_DISABLED
@@ -2789,7 +2855,9 @@ def run_server_with_tray(
                 fState=state,
             )
             try:
-                set_menu_item_info(menu_handle[0], command_id, False, ctypes.byref(menu_item))
+                set_menu_item_info(
+                    menu_handle[0], command_id, False, ctypes.byref(menu_item)
+                )
                 draw_menu_bar(self._menu_hwnd)
             except Exception:
                 pass
@@ -3004,7 +3072,9 @@ def run_server_with_tray(
     def build_tray_menu():
         quota_items = tuple(
             pystray.MenuItem(line, None, enabled=False)
-            for line in tray_quota_display_lines(latest_quota_for_display(refresh=False))
+            for line in tray_quota_display_lines(
+                latest_quota_for_display(refresh=False)
+            )
         )
         remote_item = pystray.MenuItem(
             remote_control_text,
@@ -3019,7 +3089,9 @@ def run_server_with_tray(
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Test Alert", on_bell),
             remote_item,
-            pystray.MenuItem("Start at Logon", on_toggle_startup, checked=startup_checked),
+            pystray.MenuItem(
+                "Start at Logon", on_toggle_startup, checked=startup_checked
+            ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Exit", on_exit),
         )
@@ -3035,6 +3107,7 @@ def run_server_with_tray(
         menu=pystray.Menu(build_tray_menu),
     )
     if start_remote_control:
+
         def _notify_auto_start_error(error: str) -> None:
             try:
                 icon.notify(safe_short(error, 180), CODEX_REMOTE_MENU_LABEL)
