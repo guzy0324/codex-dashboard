@@ -12,7 +12,8 @@ Codex Dashboard 是一个面向 OpenAI Codex hooks 的本地 Flask 小面板。�
 - 把内部标题生成 turn 归并到真实会话中。
 - 在 UI 中隐藏内部标题提示词。
 - 根据 transcript 事件识别人为中断的 turn。
-- 根据 transcript 中的 `token_count` rate-limit 事件显示 Codex 剩余额度。
+- 根据任务 hook 显示 Codex 剩余额度；本机 Codex CLI 可用时，通过
+  `codex app-server` 每分钟刷新一次账户额度。
 - 在真实 Codex turn 结束时播放提示音并显示闪烁式视觉提醒。
 - 对内部标题生成 turn 禁用提示音。
 - 在页面顶部显示权限请求。
@@ -116,6 +117,22 @@ pythonw codex_dashboard.py --tray --start-remote-control
 ```
 
 托盘悬停提示和右键菜单会显示最近一次已知 Codex 用量。托盘菜单还包含 Open Dashboard、Test Alert、Codex Remote Control、Start at Logon 和 Exit。
+
+Dashboard 启动时如果能找到本机 Codex CLI，会在后台启动一个本地
+`codex app-server` 进程，启动时以及每隔 1 分钟调用一次
+`account/rateLimits/read`。如果进程退出或读取失败，会使用指数退避重启和
+重试。任务 `stop` hook 带回的 quota 会立即使用，不会因为任务完成再额外
+调用一次 app-server。若 app-server 不可用，仍会保留 transcript quota 作为
+回退路径。可以设置 `CODEX_DASHBOARD_CODEX_CMD` 覆盖轮询器和 Remote
+Control 使用的 Codex CLI 命令。
+
+轮询器诊断日志默认写入项目目录下的 `logs\codex_dashboard_quota.log`；也可以通过
+`CODEX_DASHBOARD_QUOTA_LOG` 指定路径。设置 `CODEX_DASHBOARD_QUOTA_DEBUG=1`
+时，日志还会输出到 stderr。日志只记录启动、请求、响应字段、窗口数量和
+错误信息，不记录完整响应或 token。轮询器默认会给 app-server 使用项目目录下的
+`sqlite\` 作为独立 SQLite 状态目录，避免和其他 Codex 进程争用默认的 `.codex`
+状态目录；如果已经设置 `CODEX_SQLITE_HOME` 会优先使用它，也可以用
+`CODEX_DASHBOARD_SQLITE_HOME` 覆盖 dashboard 的默认目录。
 
 `Codex Remote Control` 菜单项会在检测到 `codex remote-control` 正在运行时显示勾选。每次打开右键菜单时，该项会先显示 `Checking...` 并在后台检测，完成后直接更新当前已打开菜单中的勾选状态；如果提前关闭菜单，未完成的检测会被取消。未勾选时点击该项会在后台执行跨平台命令 `codex remote-control`，并在启动确认期间显示禁用的 `Starting...`，避免服务尚未出现时被重复启动；已勾选时再次点击会在后台关闭 Remote Control，并在确认停止期间显示禁用的 `Stopping...`。Windows 上该后台进程仍使用无控制台窗口的创建标志。如需覆盖用于启动的 Codex CLI 路径，可以设置环境变量 `CODEX_DASHBOARD_CODEX_CMD`。
 

@@ -5,6 +5,7 @@ import json
 import locale
 import os
 import platform
+import queue
 import shutil
 import signal
 import subprocess
@@ -39,15 +40,30 @@ CODEX_REMOTE_SUBCOMMAND = "remote-control"
 CODEX_REMOTE_MENU_LABEL = "Codex Remote Control"
 CODEX_REMOTE_START_TIMEOUT_SECONDS = 15.0
 CODEX_REMOTE_STOP_TIMEOUT_SECONDS = 15.0
+CODEX_APP_SERVER_CLIENT_NAME = "codex_dashboard"
+CODEX_SQLITE_HOME_ENV = "CODEX_SQLITE_HOME"
+CODEX_DASHBOARD_SQLITE_HOME_ENV = "CODEX_DASHBOARD_SQLITE_HOME"
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+QUOTA_REFRESH_INTERVAL_SECONDS = 60.0
+QUOTA_RETRY_BASE_SECONDS = 1.0
+QUOTA_RETRY_MAX_SECONDS = 60.0
+QUOTA_REQUEST_TIMEOUT_SECONDS = 15.0
+QUOTA_LOG_PATH = os.path.abspath(
+    (os.environ.get("CODEX_DASHBOARD_QUOTA_LOG") or "").strip()
+    or os.path.join(PROJECT_DIR, "logs", "codex_dashboard_quota.log")
+)
+QUOTA_LOG_MAX_BYTES = 2 * 1024 * 1024
 
 app = Flask(__name__)
 
 STORE_LOCK = threading.Lock()
+QUOTA_LOG_LOCK = threading.Lock()
 REMOTE_CONTROL_LOCK = threading.Lock()
 REMOTE_CONTROL_STATUS_LOCK = threading.Lock()
 CONVERSATIONS: dict[str, dict] = {}
 DONE_ALERTS: list[dict] = []
 TRANSCRIPT_QUOTA_CACHE: dict[str, dict] = {}
+ACCOUNT_QUOTA_CACHE: dict = {}
 REMOTE_CONTROL_STATUS_CACHE = {
     "available": False,
     "running": False,
@@ -79,6 +95,35 @@ def run_daemon_thread(target, **kwargs) -> None:
     threading.Thread(target=target, kwargs=kwargs, daemon=True).start()
 
 
+def quota_log(event: str, **details) -> None:
+    """Write safe, diagnostic-only quota poller events."""
+    record = {
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "event": event,
+        **details,
+    }
+    line = json.dumps(record, ensure_ascii=False, sort_keys=True, default=str)
+
+    try:
+        with QUOTA_LOG_LOCK:
+            os.makedirs(os.path.dirname(QUOTA_LOG_PATH) or ".", exist_ok=True)
+            if os.path.isfile(QUOTA_LOG_PATH):
+                try:
+                    if os.path.getsize(QUOTA_LOG_PATH) >= QUOTA_LOG_MAX_BYTES:
+                        with open(QUOTA_LOG_PATH, "w", encoding="utf-8"):
+                            pass
+                except OSError:
+                    pass
+
+            with open(QUOTA_LOG_PATH, "a", encoding="utf-8") as log_file:
+                log_file.write(line + "\n")
+    except OSError:
+        pass
+
+    if os.environ.get("CODEX_DASHBOARD_QUOTA_DEBUG") == "1":
+        print(f"[quota] {line}", file=sys.stderr, flush=True)
+
+
 def play_sound():
     system = platform.system()
 
@@ -105,6 +150,35 @@ def play_sound():
 
 def is_windows() -> bool:
     return platform.system() == "Windows"
+
+
+def default_quota_sqlite_home() -> str:
+    """Return a private SQLite state directory for the quota app-server."""
+    return os.path.join(PROJECT_DIR, "sqlite")
+
+
+def quota_app_server_environment() -> tuple[dict[str, str], str, str]:
+    """Build the app-server environment and isolate its SQLite state by default."""
+    environment = os.environ.copy()
+    configured = (environment.get(CODEX_SQLITE_HOME_ENV) or "").strip()
+    source = CODEX_SQLITE_HOME_ENV
+
+    if not configured:
+        configured = (environment.get(CODEX_DASHBOARD_SQLITE_HOME_ENV) or "").strip()
+        source = CODEX_DASHBOARD_SQLITE_HOME_ENV
+
+    if not configured:
+        configured = default_quota_sqlite_home()
+        source = "default"
+
+    if len(configured) >= 2 and configured[0] == configured[-1]:
+        if configured[0] in {"'", '"'}:
+            configured = configured[1:-1].strip()
+
+    sqlite_home = os.path.abspath(os.path.expandvars(os.path.expanduser(configured)))
+    os.makedirs(sqlite_home, exist_ok=True)
+    environment[CODEX_SQLITE_HOME_ENV] = sqlite_home
+    return environment, sqlite_home, source
 
 
 TASKBAR_TITLE_MARKERS = (
@@ -427,12 +501,74 @@ def has_startup_task(arguments: list[str] | None = None) -> bool:
     return startup_status(arguments) == "installed"
 
 
+def native_windows_codex_command(wrapper: str | None) -> str | None:
+    """Find the bundled native CLI behind an npm .cmd/.ps1 wrapper."""
+    if not is_windows() or not wrapper:
+        return None
+
+    wrapper = os.path.abspath(wrapper)
+    if os.path.splitext(wrapper)[1].lower() not in {".cmd", ".ps1"}:
+        return None
+
+    package_root = os.path.join(
+        os.path.dirname(wrapper),
+        "node_modules",
+        "@openai",
+        "codex",
+    )
+    if not os.path.isdir(package_root):
+        return None
+
+    for root, _directories, filenames in os.walk(package_root):
+        if os.path.basename(root).lower() != "bin":
+            continue
+        if "codex.exe" in {filename.lower() for filename in filenames}:
+            candidate = os.path.join(root, "codex.exe")
+            if os.path.isfile(candidate):
+                return os.path.abspath(candidate)
+
+    return None
+
+
+def prefer_native_windows_codex(command: str | None) -> str | None:
+    native = native_windows_codex_command(command)
+    if native:
+        quota_log("codex_cli_native_resolved", command=native, wrapper=command)
+    return native
+
+
 def codex_cli_command() -> str | None:
     configured = (os.environ.get("CODEX_DASHBOARD_CODEX_CMD") or "").strip()
     if configured:
-        return configured
+        configured = os.path.expandvars(os.path.expanduser(configured))
+        if len(configured) >= 2 and configured[0] == configured[-1]:
+            if configured[0] in {"'", '"'}:
+                configured = configured[1:-1].strip()
 
-    return "codex" if shutil.which("codex") else None
+        resolved = shutil.which(configured)
+        if resolved:
+            return prefer_native_windows_codex(resolved) or resolved
+        if os.path.isfile(configured):
+            resolved = os.path.abspath(configured)
+            return prefer_native_windows_codex(resolved) or resolved
+        quota_log("configured_cli_not_found", command=configured)
+
+    resolved = shutil.which("codex") or shutil.which("codex.cmd")
+    if resolved:
+        return prefer_native_windows_codex(resolved) or resolved
+
+    if is_windows():
+        appdata = (os.environ.get("APPDATA") or "").strip()
+        if appdata:
+            for filename in ("codex.cmd", "codex.exe"):
+                candidate = os.path.join(appdata, "npm", filename)
+                if os.path.isfile(candidate):
+                    native = prefer_native_windows_codex(candidate)
+                    command = native or candidate
+                    quota_log("codex_cli_fallback_resolved", command=command)
+                    return command
+
+    return None
 
 
 def cancellable_communicate(
@@ -1117,6 +1253,7 @@ TITLE_ATTACH_WINDOW_SECONDS = 300
 TITLE_FUTURE_TOLERANCE_SECONDS = 5
 TRANSCRIPT_TAIL_BYTES = 1024 * 1024
 RATE_LIMIT_WINDOW_KEYS = ("primary", "secondary")
+HIDDEN_APP_SERVER_LIMIT_IDS = frozenset({"base_model_inference"})
 TRAY_QUOTA_REFRESH_SECONDS = 5.0
 
 
@@ -1315,6 +1452,90 @@ def quota_summary_from_payload(payload: dict, event_ts: float | None = None) -> 
     return quota_summary_from_rate_limits(rate_limits, event_ts)
 
 
+def quota_summary_from_app_server_result(
+    result: dict, event_ts: float | None = None
+) -> dict:
+    """Convert app-server's camelCase rate-limit response to dashboard data."""
+    if not isinstance(result, dict):
+        return {}
+
+    buckets = result.get("rateLimitsByLimitId") or result.get("rate_limits_by_limit_id")
+    if not isinstance(buckets, dict) or not buckets:
+        fallback = result.get("rateLimits") or result.get("rate_limits")
+        if isinstance(fallback, dict):
+            fallback_id = fallback.get("limitId") or fallback.get("limit_id") or "codex"
+            buckets = {fallback_id: fallback}
+        else:
+            buckets = {}
+
+    bucket_items = []
+    for bucket_id, bucket in buckets.items():
+        if not isinstance(bucket, dict):
+            continue
+
+        limit_id = str(bucket.get("limitId") or bucket.get("limit_id") or bucket_id)
+        if limit_id in HIDDEN_APP_SERVER_LIMIT_IDS:
+            continue
+        bucket_items.append((str(bucket_id), bucket))
+    if not bucket_items:
+        return {}
+
+    normalized = {
+        "limit_id": "",
+        "limit_name": "",
+        "plan_type": result.get("planType") or result.get("plan_type") or "",
+        "rate_limit_reached_type": "",
+    }
+    windows = {}
+
+    for bucket_id, bucket in bucket_items:
+        limit_id = str(bucket.get("limitId") or bucket.get("limit_id") or bucket_id)
+        limit_name = bucket.get("limitName") or bucket.get("limit_name") or ""
+        if not normalized["limit_id"]:
+            normalized["limit_id"] = limit_id
+        if not normalized["limit_name"]:
+            normalized["limit_name"] = limit_name
+        if not normalized["plan_type"]:
+            normalized["plan_type"] = (
+                bucket.get("planType") or bucket.get("plan_type") or ""
+            )
+        if not normalized["rate_limit_reached_type"]:
+            normalized["rate_limit_reached_type"] = (
+                bucket.get("rateLimitReachedType")
+                or bucket.get("rate_limit_reached_type")
+                or ""
+            )
+
+        for window_key, window in bucket.items():
+            if not isinstance(window, dict):
+                continue
+
+            used_percent = window.get("usedPercent")
+            if used_percent is None:
+                used_percent = window.get("used_percent")
+            if coerce_float(used_percent) is None:
+                continue
+
+            normalized_key = f"{limit_id}:{window_key}"
+            windows[normalized_key] = {
+                "used_percent": used_percent,
+                "window_minutes": window.get("windowDurationMins")
+                or window.get("window_minutes"),
+                "resets_at": window.get("resetsAt") or window.get("resets_at"),
+            }
+
+    if not windows:
+        return {}
+
+    summary = quota_summary_from_rate_limits(normalized | windows, event_ts)
+    if len(bucket_items) > 1:
+        for window in summary.get("windows") or []:
+            key = str(window.get("key") or "")
+            limit_id = key.split(":", 1)[0]
+            window["label"] = f"{limit_id} {window.get('label') or key}"
+    return summary
+
+
 def read_transcript_tail(transcript_path: str) -> str:
     if not transcript_path or not os.path.isfile(transcript_path):
         return ""
@@ -1476,9 +1697,387 @@ def copy_quota_summary(quota: dict | None) -> dict:
     return copied
 
 
+def store_account_quota(quota: dict | None) -> bool:
+    """Store the latest account-level quota snapshot from app-server."""
+    if not isinstance(quota, dict) or not quota.get("windows"):
+        return False
+
+    updated_at = quota.get("updated_at_raw", 0) or 0
+    with STORE_LOCK:
+        current = ACCOUNT_QUOTA_CACHE.get("quota")
+        current_updated_at = (
+            current.get("updated_at_raw", 0) if isinstance(current, dict) else 0
+        ) or 0
+        if updated_at < current_updated_at:
+            return False
+
+        ACCOUNT_QUOTA_CACHE["quota"] = copy_quota_summary(quota)
+
+    return True
+
+
+class CodexQuotaPoller:
+    """Read ChatGPT/Codex rate limits through a local app-server process."""
+
+    def __init__(
+        self,
+        command: str,
+        interval_seconds: float = QUOTA_REFRESH_INTERVAL_SECONDS,
+        request_timeout_seconds: float = QUOTA_REQUEST_TIMEOUT_SECONDS,
+    ) -> None:
+        self._command = command
+        self._interval_seconds = interval_seconds
+        self._request_timeout_seconds = request_timeout_seconds
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._process_lock = threading.Lock()
+        self._write_lock = threading.Lock()
+        self._process: subprocess.Popen | None = None
+        self._messages: queue.Queue | None = None
+        self._transport_closed_event: threading.Event | None = None
+        self._reader_thread: threading.Thread | None = None
+        self._next_request_id = 0
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            quota_log("poller_start_skipped", reason="already_running")
+            return
+
+        self._thread = threading.Thread(
+            target=self._run,
+            name="codex-dashboard-quota-poller",
+            daemon=True,
+        )
+        self._thread.start()
+        quota_log(
+            "poller_started",
+            command=self._command,
+            interval_seconds=self._interval_seconds,
+            request_timeout_seconds=self._request_timeout_seconds,
+        )
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        self._close_process()
+        if self._thread and self._thread is not threading.current_thread():
+            self._thread.join(timeout=2)
+        quota_log("poller_stopped")
+
+    def _run(self) -> None:
+        retry_delay = QUOTA_RETRY_BASE_SECONDS
+        quota_log("poller_loop_started")
+
+        while not self._stop_event.is_set():
+            try:
+                transport_closed_event = self._ensure_process()
+                read_started_at = now_ts()
+                quota_log("rate_limits_read_started")
+                result = self._request(
+                    "account/rateLimits/read",
+                    {},
+                    timeout_seconds=self._request_timeout_seconds,
+                )
+                quota = quota_summary_from_app_server_result(result, read_started_at)
+                if quota:
+                    stored = store_account_quota(quota)
+                    quota_log(
+                        "rate_limits_read_succeeded",
+                        stored=stored,
+                        result_keys=sorted(result.keys()),
+                        window_count=len(quota.get("windows") or []),
+                    )
+                else:
+                    quota_log(
+                        "rate_limits_read_empty",
+                        result_keys=sorted(result.keys()),
+                    )
+
+                retry_delay = QUOTA_RETRY_BASE_SECONDS
+                self._wait_for_next_read(transport_closed_event)
+            except Exception as exc:
+                quota_log(
+                    "poller_error",
+                    command=self._command,
+                    error=f"{type(exc).__name__}: {exc}",
+                    retry_delay=retry_delay,
+                )
+                if self._stop_event.is_set():
+                    break
+
+                self._close_process()
+                if self._stop_event.wait(retry_delay):
+                    break
+                retry_delay = min(
+                    QUOTA_RETRY_MAX_SECONDS,
+                    retry_delay * 2,
+                )
+
+        self._close_process()
+
+    def _wait_for_next_read(self, transport_closed_event: threading.Event) -> None:
+        deadline = time.monotonic() + self._interval_seconds
+        while True:
+            if self._stop_event.is_set():
+                return
+            if transport_closed_event.is_set():
+                raise RuntimeError("Codex app-server connection closed")
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            self._stop_event.wait(min(remaining, 0.5))
+
+    def _ensure_process(self) -> threading.Event:
+        with self._process_lock:
+            if (
+                self._process
+                and self._process.poll() is None
+                and self._transport_closed_event
+                and not self._transport_closed_event.is_set()
+            ):
+                return self._transport_closed_event
+
+            self._terminate_process(self._process)
+            messages: queue.Queue = queue.Queue()
+            transport_closed_event = threading.Event()
+            process_arguments = [self._command, "app-server", "--stdio"]
+            process_environment, sqlite_home, sqlite_home_source = (
+                quota_app_server_environment()
+            )
+            quota_log(
+                "app_server_environment",
+                sqlite_home=sqlite_home,
+                sqlite_home_source=sqlite_home_source,
+            )
+            process = subprocess.Popen(
+                process_arguments,
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                bufsize=1,
+                creationflags=(
+                    getattr(subprocess, "CREATE_NO_WINDOW", 0) if is_windows() else 0
+                ),
+                env=process_environment,
+            )
+            self._process = process
+            self._messages = messages
+            self._transport_closed_event = transport_closed_event
+            self._reader_thread = threading.Thread(
+                target=self._read_process_output,
+                args=(process, messages, transport_closed_event),
+                name="codex-dashboard-quota-reader",
+                daemon=True,
+            )
+            self._reader_thread.start()
+            threading.Thread(
+                target=self._read_process_stderr,
+                args=(process,),
+                name="codex-dashboard-quota-stderr",
+                daemon=True,
+            ).start()
+            quota_log(
+                "app_server_started",
+                command=self._command,
+                pid=process.pid,
+                sqlite_home=sqlite_home,
+            )
+
+        self._request(
+            "initialize",
+            {
+                "clientInfo": {
+                    "name": CODEX_APP_SERVER_CLIENT_NAME,
+                    "title": APP_NAME,
+                    "version": "0.1.0",
+                }
+            },
+            timeout_seconds=self._request_timeout_seconds,
+        )
+        quota_log("app_server_initialized")
+        self._send({"method": "initialized", "params": {}})
+        return transport_closed_event
+
+    @staticmethod
+    def _read_process_output(
+        process: subprocess.Popen,
+        messages: queue.Queue,
+        transport_closed_event: threading.Event,
+    ) -> None:
+        try:
+            if not process.stdout:
+                return
+            for line in process.stdout:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    message = json.loads(line)
+                except (TypeError, ValueError):
+                    quota_log("app_server_stdout_non_json", line=line[:500])
+                    continue
+                if isinstance(message, dict):
+                    messages.put(message)
+        finally:
+            quota_log("app_server_stdout_closed", pid=process.pid)
+            transport_closed_event.set()
+            messages.put({"_transport_closed": True})
+
+    @staticmethod
+    def _read_process_stderr(process: subprocess.Popen) -> None:
+        if not process.stderr:
+            return
+
+        try:
+            for line in process.stderr:
+                line = line.strip()
+                if line:
+                    quota_log("app_server_stderr", pid=process.pid, line=line[:1000])
+        except (OSError, ValueError):
+            pass
+
+    def _request(self, method: str, params: dict, timeout_seconds: float) -> dict:
+        messages = self._messages
+        if messages is None:
+            raise RuntimeError("Codex app-server is not connected")
+
+        self._next_request_id += 1
+        request_id = self._next_request_id
+        message = {"method": method, "id": request_id}
+        if params:
+            message["params"] = params
+        quota_log(
+            "app_server_request",
+            method=method,
+            request_id=request_id,
+        )
+        self._send(message)
+        deadline = time.monotonic() + timeout_seconds
+
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise TimeoutError(f"Timed out waiting for app-server method: {method}")
+
+            try:
+                message = messages.get(timeout=min(remaining, 0.5))
+            except queue.Empty:
+                continue
+
+            if message.get("_transport_closed"):
+                raise RuntimeError("Codex app-server connection closed")
+
+            if message.get("id") != request_id:
+                continue
+            if message.get("error"):
+                error = message["error"]
+                if isinstance(error, dict):
+                    detail = error.get("message") or "app-server request failed"
+                else:
+                    detail = str(error)
+                quota_log(
+                    "app_server_response_error",
+                    method=method,
+                    request_id=request_id,
+                    error=detail,
+                )
+                raise RuntimeError(detail)
+
+            result = message.get("result")
+            if isinstance(result, dict):
+                quota_log(
+                    "app_server_response",
+                    method=method,
+                    request_id=request_id,
+                    result_keys=sorted(result.keys()),
+                )
+                return result
+
+            quota_log(
+                "app_server_response_empty",
+                method=method,
+                request_id=request_id,
+            )
+            return {}
+
+    def _send(self, message: dict) -> None:
+        with self._write_lock:
+            process = self._process
+            if not process or process.poll() is not None or not process.stdin:
+                raise RuntimeError("Codex app-server is not running")
+            process.stdin.write(json.dumps(message, ensure_ascii=False) + "\n")
+            process.stdin.flush()
+
+    def _close_process(self) -> None:
+        with self._process_lock:
+            process = self._process
+            self._process = None
+            self._messages = None
+            transport_closed_event = self._transport_closed_event
+            self._transport_closed_event = None
+            self._reader_thread = None
+            if transport_closed_event:
+                transport_closed_event.set()
+            if process:
+                quota_log("app_server_stopping", pid=process.pid)
+            self._terminate_process(process)
+
+    @staticmethod
+    def _terminate_process(process: subprocess.Popen | None) -> None:
+        if not process:
+            return
+
+        try:
+            if process.stdin:
+                process.stdin.close()
+        except (OSError, ValueError):
+            pass
+
+        if process.poll() is not None:
+            return
+
+        try:
+            process.terminate()
+            process.wait(timeout=0.5)
+        except (OSError, subprocess.TimeoutExpired):
+            try:
+                process.kill()
+            except OSError:
+                pass
+            try:
+                process.wait(timeout=0.5)
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+
+
+def start_quota_poller() -> CodexQuotaPoller | None:
+    command = codex_cli_command()
+    quota_log(
+        "poller_start_requested",
+        command=command or "",
+        cwd=os.getcwd(),
+        python=sys.executable or "",
+    )
+    if not command:
+        quota_log("poller_disabled", reason="codex_cli_not_found")
+        return None
+
+    poller = CodexQuotaPoller(command)
+    poller.start()
+    return poller
+
+
 def latest_quota_summary_unlocked() -> dict:
     latest = {}
     latest_updated_at = 0
+
+    account_quota = ACCOUNT_QUOTA_CACHE.get("quota")
+    if isinstance(account_quota, dict):
+        latest = account_quota
+        latest_updated_at = account_quota.get("updated_at_raw", 0) or 0
 
     for row in CONVERSATIONS.values():
         quota = row.get("quota")
@@ -1966,6 +2565,13 @@ def conversations():
     return jsonify(data)
 
 
+@app.get("/api/quota")
+def quota():
+    refresh_rate_limits()
+    with STORE_LOCK:
+        return jsonify(latest_quota_summary_unlocked())
+
+
 @app.get("/")
 def index():
     return """
@@ -2192,20 +2798,22 @@ let doneAckTimer = null;
 let toastTimer = null;
 
 async function load() {
-  const [alertRes, attentionRes, conversationRes] = await Promise.all([
+  const [alertRes, attentionRes, conversationRes, quotaRes] = await Promise.all([
     fetch('/api/permission_requests'),
     fetch('/api/attention'),
-    fetch('/api/conversations')
+    fetch('/api/conversations'),
+    fetch('/api/quota')
   ]);
   const alerts = await alertRes.json();
   const attention = await attentionRes.json();
   const items = await conversationRes.json();
+  const accountQuota = await quotaRes.json();
 
   const alertList = document.getElementById('alerts');
   const list = document.getElementById('list');
   alertList.innerHTML = alerts.map(renderAlert).join('');
   updateAttention(attention);
-  renderQuota(items);
+  renderQuota(items, accountQuota);
 
   if (!items.length) {
     list.innerHTML = '<div class="muted">No Codex events in this run yet.</div>';
@@ -2245,20 +2853,22 @@ async function load() {
   }).join('');
 }
 
-function renderQuota(items) {
+function renderQuota(items, accountQuota) {
   const quotaEl = document.getElementById('quota');
   if (!quotaEl) {
     return;
   }
 
   const quotaItem = items.find(item => quotaSummary(item.quota));
-  if (!quotaItem) {
+  const quota = quotaSummary(accountQuota)
+    ? accountQuota
+    : (quotaItem ? quotaItem.quota : null);
+  if (!quota) {
     quotaEl.innerHTML = '';
     quotaEl.classList.remove('visible');
     return;
   }
 
-  const quota = quotaItem.quota || {};
   const windows = Array.isArray(quota.windows) ? quota.windows : [];
   const updated = quota.updated_at || '';
   quotaEl.innerHTML = `
@@ -2747,7 +3357,12 @@ def run_server_blocking(open_browser: bool, start_remote_control: bool = False) 
                 file=sys.stderr,
             )
         )
-    app.run(host=HOST, port=PORT, debug=False, threaded=True)
+    quota_poller = start_quota_poller()
+    try:
+        app.run(host=HOST, port=PORT, debug=False, threaded=True)
+    finally:
+        if quota_poller:
+            quota_poller.stop()
     return 0
 
 
@@ -2784,6 +3399,7 @@ def run_server_with_tray(
 
     server.start()
     print(f"Codex dashboard: {DASHBOARD_URL}")
+    quota_poller = start_quota_poller()
 
     if open_browser:
         open_dashboard_browser()
@@ -3130,6 +3746,8 @@ def run_server_with_tray(
     finally:
         attention_stop.set()
         attention_thread.join(timeout=2)
+        if quota_poller:
+            quota_poller.stop()
         server.shutdown()
         if exit_requested.is_set():
             os._exit(0)

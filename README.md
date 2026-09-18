@@ -14,7 +14,8 @@ The dashboard is intentionally in-memory. Restarting the server clears the page.
 - Groups internal title-generation turns into the real conversation.
 - Hides internal title prompts from the UI.
 - Detects manually interrupted turns from transcript events.
-- Shows remaining Codex quota from transcript `token_count` rate-limit events.
+- Shows remaining Codex quota from task hooks and, when the local Codex CLI is
+  available, refreshes it through `codex app-server` once per minute.
 - Plays a sound and flashes a visual reminder when a real Codex turn finishes.
 - Suppresses sound for internal title-generation turns.
 - Shows permission requests at the top of the page.
@@ -131,6 +132,25 @@ pythonw codex_dashboard.py --tray --start-remote-control
 The tray tooltip and right-click menu show the latest known Codex usage. The
 tray menu also includes Open Dashboard, Test Alert, Codex Remote Control,
 Start at Logon, and Exit.
+
+The dashboard starts a local `codex app-server` process when the Codex CLI is
+available, reads `account/rateLimits/read` at startup and once per minute, and
+restarts the process with exponential backoff if it exits or a request fails.
+The quota included by the task `stop` hook is applied immediately; the stop
+hook does not trigger another app-server read. If app-server is unavailable,
+transcript quota handling remains available as a fallback. Set
+`CODEX_DASHBOARD_CODEX_CMD` to override the Codex CLI command used by the
+poller as well as Remote Control.
+
+Quota poller diagnostics are written to `logs/codex_dashboard_quota.log` under
+the project directory by default. Set `CODEX_DASHBOARD_QUOTA_LOG` to choose
+another path, or set `CODEX_DASHBOARD_QUOTA_DEBUG=1` to also print them to
+stderr. The log records startup, requests, response keys, window counts, and
+errors; it does not record full responses or tokens. The poller uses
+`sqlite/` under the project directory as its private app-server SQLite state
+directory by default, avoiding contention with other Codex processes using
+`.codex`. An existing `CODEX_SQLITE_HOME` value takes precedence; set
+`CODEX_DASHBOARD_SQLITE_HOME` to override the dashboard default.
 
 `Codex Remote Control` is checked while a running `codex remote-control`
 process is detected. Each time the context menu opens, the item first displays
