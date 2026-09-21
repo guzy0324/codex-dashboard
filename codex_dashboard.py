@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 import argparse
 import csv
 import json
 import locale
+import math
 import os
 import platform
 import queue
@@ -16,6 +19,8 @@ import time
 import webbrowser
 import xml.etree.ElementTree as ET
 from datetime import datetime
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 from flask import Flask, Response, jsonify, request
 from werkzeug.serving import make_server
@@ -48,6 +53,10 @@ QUOTA_REFRESH_INTERVAL_SECONDS = 60.0
 QUOTA_RETRY_BASE_SECONDS = 1.0
 QUOTA_RETRY_MAX_SECONDS = 60.0
 QUOTA_REQUEST_TIMEOUT_SECONDS = 15.0
+QUOTA_KEEPALIVE_SERVICE_URL_ENV = "CODEX_DASHBOARD_QUOTA_KEEPALIVE_URL"
+QUOTA_KEEPALIVE_SERVICE_TOKEN_ENV = "CODEX_DASHBOARD_QUOTA_KEEPALIVE_TOKEN"
+QUOTA_KEEPALIVE_MONITOR_INTERVAL_SECONDS = 30.0
+QUOTA_KEEPALIVE_MONITOR_TIMEOUT_SECONDS = 5.0
 QUOTA_LOG_PATH = os.path.abspath(
     (os.environ.get("CODEX_DASHBOARD_QUOTA_LOG") or "").strip()
     or os.path.join(PROJECT_DIR, "logs", "codex_dashboard_quota.log")
@@ -75,6 +84,8 @@ REMOTE_CONTROL_STATUS_CACHE = {
     "stopping": False,
     "stopping_until": 0.0,
 }
+QUOTA_KEEPALIVE_MONITOR_LOCK = threading.Lock()
+QUOTA_KEEPALIVE_MONITOR = None
 
 
 class RemoteControlProbeCancelled(Exception):
@@ -1724,11 +1735,14 @@ class CodexQuotaPoller:
         command: str,
         interval_seconds: float = QUOTA_REFRESH_INTERVAL_SECONDS,
         request_timeout_seconds: float = QUOTA_REQUEST_TIMEOUT_SECONDS,
+        status_callback=None,
     ) -> None:
         self._command = command
         self._interval_seconds = interval_seconds
         self._request_timeout_seconds = request_timeout_seconds
         self._stop_event = threading.Event()
+        self._refresh_event = threading.Event()
+        self._result_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._process_lock = threading.Lock()
         self._write_lock = threading.Lock()
@@ -1737,6 +1751,12 @@ class CodexQuotaPoller:
         self._transport_closed_event: threading.Event | None = None
         self._reader_thread: threading.Thread | None = None
         self._next_request_id = 0
+        self._status_lock = threading.Lock()
+        self._last_attempt_at = 0.0
+        self._last_success_at = 0.0
+        self._last_quota: dict = {}
+        self._last_result: dict = {}
+        self._status_callback = status_callback
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -1763,14 +1783,90 @@ class CodexQuotaPoller:
             self._thread.join(timeout=2)
         quota_log("poller_stopped")
 
+    def snapshot(self) -> dict:
+        with self._status_lock:
+            thread = self._thread
+            return {
+                "running": bool(
+                    thread and thread.is_alive() and not self._stop_event.is_set()
+                ),
+                "last_attempt_at": self._last_attempt_at or None,
+                "last_success_at": self._last_success_at or None,
+                "quota": copy_quota_summary(self._last_quota),
+                "last_result": dict(self._last_result),
+            }
+
+    def refresh_now(
+        self,
+        after_timestamp: float | None = None,
+        timeout_seconds: float = QUOTA_REQUEST_TIMEOUT_SECONDS * 2,
+    ) -> dict | None:
+        """Request a rate-limit read that started after ``after_timestamp``."""
+        requested_at = now_ts() if after_timestamp is None else after_timestamp
+        self._result_event.clear()
+        self._refresh_event.set()
+        deadline = time.monotonic() + max(0.1, timeout_seconds)
+
+        while not self._stop_event.is_set():
+            status = self.snapshot()
+            result = status.get("last_result") or {}
+            try:
+                attempted_at = float(result.get("attempted_at") or 0)
+            except (TypeError, ValueError):
+                attempted_at = 0
+            if attempted_at >= requested_at:
+                return status
+
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            self._result_event.wait(min(remaining, 0.5))
+            self._result_event.clear()
+
+        return None
+
+    def _record_attempt(self, attempted_at: float) -> None:
+        with self._status_lock:
+            self._last_attempt_at = attempted_at
+
+    def _record_result(
+        self,
+        attempted_at: float,
+        success: bool,
+        quota: dict | None = None,
+        error: str = "",
+    ) -> None:
+        completed_at = now_ts()
+        with self._status_lock:
+            self._last_attempt_at = attempted_at
+            if success and quota:
+                self._last_success_at = completed_at
+                self._last_quota = copy_quota_summary(quota)
+            self._last_result = {
+                "success": bool(success),
+                "attempted_at": attempted_at,
+                "completed_at": completed_at,
+                "error": error,
+            }
+        self._result_event.set()
+        if self._status_callback:
+            try:
+                self._status_callback(self.snapshot())
+            except Exception as exc:
+                quota_log(
+                    "poller_status_callback_error",
+                    error=f"{type(exc).__name__}: {exc}",
+                )
+
     def _run(self) -> None:
         retry_delay = QUOTA_RETRY_BASE_SECONDS
         quota_log("poller_loop_started")
 
         while not self._stop_event.is_set():
+            read_started_at = now_ts()
+            self._record_attempt(read_started_at)
             try:
                 transport_closed_event = self._ensure_process()
-                read_started_at = now_ts()
                 quota_log("rate_limits_read_started")
                 result = self._request(
                     "account/rateLimits/read",
@@ -1780,6 +1876,7 @@ class CodexQuotaPoller:
                 quota = quota_summary_from_app_server_result(result, read_started_at)
                 if quota:
                     stored = store_account_quota(quota)
+                    self._record_result(read_started_at, success=True, quota=quota)
                     quota_log(
                         "rate_limits_read_succeeded",
                         stored=stored,
@@ -1787,6 +1884,11 @@ class CodexQuotaPoller:
                         window_count=len(quota.get("windows") or []),
                     )
                 else:
+                    self._record_result(
+                        read_started_at,
+                        success=False,
+                        error="Codex returned no rate-limit windows",
+                    )
                     quota_log(
                         "rate_limits_read_empty",
                         result_keys=sorted(result.keys()),
@@ -1795,6 +1897,11 @@ class CodexQuotaPoller:
                 retry_delay = QUOTA_RETRY_BASE_SECONDS
                 self._wait_for_next_read(transport_closed_event)
             except Exception as exc:
+                self._record_result(
+                    read_started_at,
+                    success=False,
+                    error=f"{type(exc).__name__}: {exc}",
+                )
                 quota_log(
                     "poller_error",
                     command=self._command,
@@ -1805,7 +1912,7 @@ class CodexQuotaPoller:
                     break
 
                 self._close_process()
-                if self._stop_event.wait(retry_delay):
+                if self._wait_for_retry(retry_delay):
                     break
                 retry_delay = min(
                     QUOTA_RETRY_MAX_SECONDS,
@@ -1813,6 +1920,17 @@ class CodexQuotaPoller:
                 )
 
         self._close_process()
+
+    def _wait_for_retry(self, retry_delay: float) -> bool:
+        deadline = time.monotonic() + retry_delay
+        while not self._stop_event.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            if self._refresh_event.wait(min(remaining, 0.5)):
+                self._refresh_event.clear()
+                return False
+        return True
 
     def _wait_for_next_read(self, transport_closed_event: threading.Event) -> None:
         deadline = time.monotonic() + self._interval_seconds
@@ -1825,7 +1943,9 @@ class CodexQuotaPoller:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return
-            self._stop_event.wait(min(remaining, 0.5))
+            if self._refresh_event.wait(min(remaining, 0.5)):
+                self._refresh_event.clear()
+                return
 
     def _ensure_process(self) -> threading.Event:
         with self._process_lock:
@@ -2051,6 +2171,148 @@ class CodexQuotaPoller:
                 process.wait(timeout=0.5)
             except (OSError, subprocess.TimeoutExpired):
                 pass
+
+
+class CodexQuotaKeepaliveMonitor:
+    """Poll the configured Codex quota keepalive endpoint and cache its status."""
+
+    def __init__(
+        self,
+        url: str,
+        token: str,
+        interval_seconds: float = QUOTA_KEEPALIVE_MONITOR_INTERVAL_SECONDS,
+        request_timeout_seconds: float = QUOTA_KEEPALIVE_MONITOR_TIMEOUT_SECONDS,
+    ) -> None:
+        self._url = url.rstrip("/")
+        self._token = token
+        self._interval_seconds = interval_seconds
+        self._request_timeout_seconds = request_timeout_seconds
+        self._stop_event = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._status_lock = threading.Lock()
+        self._status = {
+            "enabled": True,
+            "reachable": False,
+            "authenticated": False,
+            "checked_at": None,
+            "remote": None,
+            "error": "Waiting for the first status check",
+        }
+
+    def start(self) -> None:
+        if self._thread and self._thread.is_alive():
+            return
+        self._thread = threading.Thread(
+            target=self._run,
+            name="codex-dashboard-quota-keepalive-monitor",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop_event.set()
+        if self._thread and self._thread is not threading.current_thread():
+            self._thread.join(timeout=2)
+
+    def snapshot(self) -> dict:
+        with self._status_lock:
+            return json.loads(json.dumps(self._status, ensure_ascii=False))
+
+    def _run(self) -> None:
+        while not self._stop_event.is_set():
+            self._check_once()
+            if self._stop_event.wait(self._interval_seconds):
+                break
+
+    def _check_once(self) -> None:
+        checked_at = now_ts()
+        headers = {}
+        if self._token:
+            headers["Authorization"] = f"Bearer {self._token}"
+        req = Request(
+            f"{self._url}/api/status",
+            headers=headers,
+            method="GET",
+        )
+        try:
+            with urlopen(req, timeout=self._request_timeout_seconds) as response:
+                remote_status = json.loads(response.read().decode("utf-8"))
+            if not isinstance(remote_status, dict):
+                raise ValueError("Keepalive API returned a non-object status")
+            self._store_status(
+                reachable=True,
+                authenticated=True,
+                checked_at=checked_at,
+                remote=remote_status,
+                error="",
+            )
+        except HTTPError as exc:
+            self._store_status(
+                reachable=True,
+                authenticated=False,
+                checked_at=checked_at,
+                remote=None,
+                error=f"HTTP {exc.code}: {exc.reason}",
+            )
+        except (URLError, TimeoutError, OSError, ValueError) as exc:
+            self._store_status(
+                reachable=False,
+                authenticated=False,
+                checked_at=checked_at,
+                remote=None,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        except Exception as exc:
+            self._store_status(
+                reachable=False,
+                authenticated=False,
+                checked_at=checked_at,
+                remote=None,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+
+    def _store_status(
+        self,
+        reachable: bool,
+        authenticated: bool,
+        checked_at: float,
+        remote: dict | None,
+        error: str,
+    ) -> None:
+        with self._status_lock:
+            if remote is None:
+                remote = self._status.get("remote")
+            self._status = {
+                "enabled": True,
+                "reachable": reachable,
+                "authenticated": authenticated,
+                "checked_at": checked_at,
+                "remote": remote,
+                "error": error,
+            }
+
+
+def start_codex_quota_keepalive_monitor() -> CodexQuotaKeepaliveMonitor | None:
+    global QUOTA_KEEPALIVE_MONITOR
+
+    url = (os.environ.get(QUOTA_KEEPALIVE_SERVICE_URL_ENV) or "").strip()
+    if not url:
+        return None
+
+    token = (os.environ.get(QUOTA_KEEPALIVE_SERVICE_TOKEN_ENV) or "").strip()
+    monitor = CodexQuotaKeepaliveMonitor(url, token)
+    with QUOTA_KEEPALIVE_MONITOR_LOCK:
+        QUOTA_KEEPALIVE_MONITOR = monitor
+    monitor.start()
+    return monitor
+
+
+def codex_quota_keepalive_service_status() -> dict:
+    with QUOTA_KEEPALIVE_MONITOR_LOCK:
+        monitor = QUOTA_KEEPALIVE_MONITOR
+    if not monitor:
+        return {"enabled": False}
+    return monitor.snapshot()
 
 
 def start_quota_poller() -> CodexQuotaPoller | None:
@@ -2572,6 +2834,11 @@ def quota():
         return jsonify(latest_quota_summary_unlocked())
 
 
+@app.get("/api/codex_quota_keepalive")
+def codex_quota_keepalive():
+    return jsonify(codex_quota_keepalive_service_status())
+
+
 @app.get("/")
 def index():
     return """
@@ -2784,6 +3051,7 @@ def index():
   <h1>Codex Dashboard</h1>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <div id="quota" class="quota-strip"></div>
+  <div id="codex-quota-keepalive"></div>
   <div id="alerts" class="alerts"></div>
   <div id="list"></div>
 
@@ -2798,22 +3066,25 @@ let doneAckTimer = null;
 let toastTimer = null;
 
 async function load() {
-  const [alertRes, attentionRes, conversationRes, quotaRes] = await Promise.all([
+  const [alertRes, attentionRes, conversationRes, quotaRes, quotaKeepaliveRes] = await Promise.all([
     fetch('/api/permission_requests'),
     fetch('/api/attention'),
     fetch('/api/conversations'),
-    fetch('/api/quota')
+    fetch('/api/quota'),
+    fetch('/api/codex_quota_keepalive')
   ]);
   const alerts = await alertRes.json();
   const attention = await attentionRes.json();
   const items = await conversationRes.json();
   const accountQuota = await quotaRes.json();
+  const quotaKeepaliveStatus = await quotaKeepaliveRes.json();
 
   const alertList = document.getElementById('alerts');
   const list = document.getElementById('list');
   alertList.innerHTML = alerts.map(renderAlert).join('');
   updateAttention(attention);
   renderQuota(items, accountQuota);
+  renderCodexQuotaKeepalive(quotaKeepaliveStatus);
 
   if (!items.length) {
     list.innerHTML = '<div class="muted">No Codex events in this run yet.</div>';
@@ -2851,6 +3122,129 @@ async function load() {
       </div>
     `;
   }).join('');
+}
+
+function renderCodexQuotaKeepalive(status) {
+  const container = document.getElementById('codex-quota-keepalive');
+  if (!container || !status || !status.enabled) {
+    if (container) {
+      container.innerHTML = '';
+    }
+    return;
+  }
+
+  const reachable = Boolean(status.reachable);
+  const authenticated = Boolean(status.authenticated);
+  const remote = status.remote || {};
+  const execution = remote.last_execution || {};
+  const keepalive = remote.last_keepalive || {};
+  const keepaliveCheck = remote.keepalive_check || {};
+  const hasKeepaliveStatus = Object.prototype.hasOwnProperty.call(remote, 'last_keepalive');
+  const pollerRunning = Boolean(remote.rate_limit_poller_running);
+  let badgeClass = 'thinking';
+  let badgeText = 'Waiting for first check';
+
+  if (!reachable) {
+    badgeClass = 'interrupted';
+    badgeText = 'HTTP service unavailable';
+  } else if (!authenticated) {
+    badgeClass = 'permission';
+    badgeText = 'Status API error';
+  } else if (!pollerRunning) {
+    badgeClass = 'interrupted';
+    badgeText = 'Reset poller stopped';
+  } else if (hasKeepaliveStatus && !remote.keepalive_worker_running) {
+    badgeClass = 'interrupted';
+    badgeText = 'Keepalive worker stopped';
+  } else if (keepalive.state === 'running') {
+    badgeClass = 'thinking';
+    badgeText = 'Keepalive running';
+  } else if (keepalive.success === false) {
+    badgeClass = 'permission';
+    badgeText = 'Last keepalive failed';
+  } else if (execution.success === false) {
+    badgeClass = 'permission';
+    badgeText = 'Rate-limit check failed';
+  } else if (keepalive.success === true) {
+    badgeClass = 'done';
+    badgeText = 'Service running';
+  } else if (execution.success === true) {
+    badgeClass = 'done';
+    badgeText = 'Service running';
+  }
+
+  let resetText = 'No five-hour reset result yet';
+  if (execution.reset_state === 'passed') {
+    resetText = 'Reset time has passed';
+  } else if (execution.reset_state === 'waiting') {
+    resetText = 'Reset time is in the future';
+  } else if (execution.reset_state === 'mixed') {
+    resetText = 'Reset windows have mixed states';
+  } else if (execution.reset_state === 'error') {
+    resetText = 'Reset status unavailable';
+  }
+
+  const checkedAt = formatTimestamp(status.checked_at);
+  const executionAt = formatTimestamp(execution.checked_at);
+  const keepaliveAt = formatTimestamp(keepalive.finished_at || keepalive.started_at);
+  const keepaliveCheckAt = formatTimestamp(keepaliveCheck.checked_at);
+  const keepaliveStatusText = keepalive.state === 'running'
+    ? 'running'
+    : keepalive.success === true
+      ? 'last run succeeded'
+      : keepalive.success === false
+        ? 'last run failed'
+        : 'not run yet';
+  const keepaliveCheckText = keepaliveCheck.state === 'waiting_reset'
+    ? 'waiting for reset time'
+    : keepaliveCheck.state === 'due'
+      ? 'reset time passed'
+      : keepaliveCheck.state === 'retry_wait'
+        ? 'waiting for the next check interval'
+        : keepaliveCheck.state === 'read_error' || keepaliveCheck.state === 'unavailable' || keepaliveCheck.state === 'error'
+          ? 'reset check unavailable'
+          : '';
+  const resetWindows = Array.isArray(execution.reset_windows)
+    ? execution.reset_windows
+    : [];
+  const resetWindowText = resetWindows.map(window => {
+    const windowState = window.reset_state === 'passed' ? 'passed' : 'waiting';
+    return `${window.label || '5h'}: ${windowState}`;
+  }).join(', ');
+  const resetAtText = resetWindows.map(window => {
+    const timestamp = formatTimestamp(window.reset_at);
+    return timestamp ? `${window.label || '5h'}: ${timestamp}` : '';
+  }).filter(Boolean).join(', ');
+  const resetAt = resetAtText || formatTimestamp(execution.reset_at);
+  const error = !authenticated
+    ? status.error
+    : keepalive.success === false && keepalive.error
+      ? keepalive.error
+      : keepaliveCheck.error || execution.error;
+  container.innerHTML = `
+    <div class="card">
+      <div class="row">
+        <span class="badge ${badgeClass}">${escapeHtml(badgeText)}</span>
+        <span>Codex Quota Keepalive</span>
+      </div>
+      <div class="row muted">
+        <span>HTTP: ${reachable ? 'reachable' : 'unreachable'}</span>
+        ${reachable ? `<span>status API: ${authenticated ? 'ok' : 'error'}</span>` : ''}
+        ${remote.service_running ? '<span>service: running</span>' : ''}
+        ${checkedAt ? `<span>dashboard checked: ${escapeHtml(checkedAt)}</span>` : ''}
+        ${executionAt ? `<span>last rate-limit read: ${escapeHtml(executionAt)}</span>` : ''}
+        ${hasKeepaliveStatus ? `<span>keepalive: ${escapeHtml(keepaliveStatusText)}</span>` : ''}
+        ${hasKeepaliveStatus && keepaliveAt ? `<span>last keepalive: ${escapeHtml(keepaliveAt)}</span>` : ''}
+        ${keepaliveCheckAt ? `<span>reset checked: ${escapeHtml(keepaliveCheckAt)}</span>` : ''}
+        ${keepaliveCheckText ? `<span>next action: ${escapeHtml(keepaliveCheckText)}</span>` : ''}
+        ${keepalive.reset_at_before ? `<span>reset before keepalive: ${escapeHtml(formatTimestamp(keepalive.reset_at_before))}</span>` : ''}
+        ${keepalive.reset_at_after ? `<span>reset after keepalive: ${escapeHtml(formatTimestamp(keepalive.reset_at_after))}</span>` : ''}
+        <span>5-hour window: ${escapeHtml(resetWindowText || resetText)}</span>
+        ${resetAt ? `<span>reset at: ${escapeHtml(resetAt)}</span>` : ''}
+      </div>
+      ${error ? `<div class="muted">Error: ${escapeHtml(error)}</div>` : ''}
+    </div>
+  `;
 }
 
 function renderQuota(items, accountQuota) {
@@ -2922,6 +3316,14 @@ function formatPercent(value) {
 
   const rounded = Math.round(num * 10) / 10;
   return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1);
+}
+
+function formatTimestamp(value) {
+  const timestamp = Number(value);
+  if (!Number.isFinite(timestamp) || timestamp <= 0) {
+    return '';
+  }
+  return new Date(timestamp * 1000).toLocaleString();
 }
 
 function clampNumber(value, min, max) {
@@ -3178,7 +3580,36 @@ def tray_attention_title(attention: dict) -> str:
     return safe_short(title, 120)
 
 
-def quota_window_usage_text(window: dict, include_reset: bool = False) -> str:
+def reset_countdown_text(reset_at: float | None) -> str:
+    if not reset_at:
+        return ""
+
+    remaining_seconds = reset_at - time.time()
+    if remaining_seconds <= 0:
+        return "due"
+
+    remaining_minutes = max(1, math.ceil(remaining_seconds / 60))
+    days, remaining_minutes = divmod(remaining_minutes, 24 * 60)
+    hours, minutes = divmod(remaining_minutes, 60)
+    if days:
+        return f"{days}d {hours}h" if hours else f"{days}d"
+    if hours:
+        return f"{hours}h {minutes}m" if minutes else f"{hours}h"
+    return f"{minutes}m"
+
+
+def window_reset_countdown(window: dict) -> str:
+    reset_at = coerce_event_timestamp(
+        window.get("resets_at_raw") or window.get("resets_at")
+    )
+    return reset_countdown_text(reset_at)
+
+
+def quota_window_usage_text(
+    window: dict,
+    include_reset: bool = False,
+    include_reset_countdown: bool = False,
+) -> str:
     if not isinstance(window, dict):
         return ""
 
@@ -3190,6 +3621,10 @@ def quota_window_usage_text(window: dict, include_reset: bool = False) -> str:
         details.append(f"{remaining}% left")
     if include_reset and window.get("resets_at"):
         details.append(f"resets {window['resets_at']}")
+    if include_reset_countdown:
+        countdown = window_reset_countdown(window)
+        if countdown:
+            details.append("reset due" if countdown == "due" else f"in {countdown}")
 
     if not details:
         return ""
@@ -3200,6 +3635,7 @@ def tray_quota_display_lines(
     quota: dict,
     max_windows: int = 4,
     include_reset: bool = True,
+    include_reset_countdown: bool = False,
     include_updated: bool = True,
     no_quota_text: str = "Usage: no quota yet",
 ) -> list[str]:
@@ -3209,7 +3645,11 @@ def tray_quota_display_lines(
 
     lines = []
     for window in windows[:max_windows]:
-        text = quota_window_usage_text(window, include_reset=include_reset)
+        text = quota_window_usage_text(
+            window,
+            include_reset=include_reset,
+            include_reset_countdown=include_reset_countdown,
+        )
         if text:
             lines.append(f"Usage {text}")
 
@@ -3222,6 +3662,165 @@ def tray_quota_display_lines(
         lines.append(f"Usage updated: {updated_at}")
 
     return lines or ([no_quota_text] if no_quota_text else [])
+
+
+def tray_quota_keepalive_countdown(remote: dict) -> str:
+    execution = remote.get("last_execution") or {}
+    windows = execution.get("reset_windows") or []
+    if not isinstance(windows, list):
+        return ""
+    for window in windows:
+        if not isinstance(window, dict):
+            continue
+        reset_at = coerce_event_timestamp(window.get("reset_at"))
+        countdown = reset_countdown_text(reset_at)
+        if countdown:
+            return "reset due" if countdown == "due" else f"reset in {countdown}"
+    return ""
+
+
+def tray_quota_keepalive_status_line(status: dict | None) -> str:
+    if not isinstance(status, dict) or not status.get("enabled"):
+        return ""
+    if not status.get("reachable"):
+        return "Keepalive: unavailable"
+    if not status.get("authenticated"):
+        return "Keepalive API: error"
+
+    remote = status.get("remote") or {}
+    if not remote.get("service_running"):
+        return "Keepalive: stopped"
+    if not remote.get("rate_limit_poller_running"):
+        return "Keepalive poller: stopped"
+
+    countdown = tray_quota_keepalive_countdown(remote)
+
+    def with_countdown(line: str) -> str:
+        return f"{line}; {countdown}" if countdown else line
+
+    has_keepalive_status = "last_keepalive" in remote
+    keepalive = remote.get("last_keepalive") or {}
+    if has_keepalive_status and not remote.get("keepalive_worker_running"):
+        return with_countdown("Keepalive: worker stopped")
+    if keepalive.get("state") == "running":
+        return with_countdown("Keepalive: running")
+    if keepalive.get("success") is False:
+        return with_countdown("Keepalive: last run failed")
+
+    keepalive_check = remote.get("keepalive_check") or {}
+    execution = remote.get("last_execution") or {}
+    if keepalive_check.get("state") in {"read_error", "unavailable", "error"}:
+        return with_countdown("Keepalive: quota check failed")
+    if execution.get("success") is False:
+        return with_countdown("Keepalive: quota check failed")
+    if keepalive.get("success") is True:
+        return with_countdown("Keepalive: last run succeeded")
+    if keepalive_check.get("state") == "waiting_reset":
+        return with_countdown("Keepalive: waiting for reset")
+    if keepalive_check.get("state") == "retry_wait":
+        return with_countdown("Keepalive: waiting for next check")
+    if keepalive_check.get("state") == "due":
+        return with_countdown("Keepalive: reset is due")
+
+    if execution.get("success") is True:
+        reset_state = execution.get("reset_state")
+        if reset_state == "passed":
+            return with_countdown("Keepalive: reset passed")
+        if reset_state == "waiting":
+            return with_countdown("Keepalive: reset pending")
+        if reset_state == "mixed":
+            return with_countdown("Keepalive: reset windows mixed")
+        if reset_state == "error":
+            return with_countdown("Keepalive: reset result unavailable")
+        return with_countdown("Keepalive: quota check succeeded")
+    if execution.get("success") is False:
+        return with_countdown("Keepalive: quota check failed")
+    return with_countdown("Keepalive: waiting for first quota check")
+
+
+def tray_hover_quota_keepalive_line(status: dict | None) -> str:
+    if not isinstance(status, dict) or not status.get("enabled"):
+        return ""
+    if not status.get("reachable"):
+        return "Keepalive: offline"
+    if not status.get("authenticated"):
+        return "Keepalive API: error"
+
+    remote = status.get("remote") or {}
+    if not remote.get("service_running"):
+        return "Keepalive: stopped"
+    if not remote.get("rate_limit_poller_running"):
+        return "Keepalive poller: stopped"
+
+    countdown = tray_quota_keepalive_countdown(remote)
+
+    def with_countdown(line: str) -> str:
+        return f"{line}; {countdown}" if countdown else line
+
+    has_keepalive_status = "last_keepalive" in remote
+    keepalive = remote.get("last_keepalive") or {}
+    if has_keepalive_status and not remote.get("keepalive_worker_running"):
+        return with_countdown("Keepalive: worker stopped")
+    if keepalive.get("state") == "running":
+        return with_countdown("Keepalive: running")
+    if keepalive.get("success") is False:
+        return with_countdown("Keepalive: last run failed")
+
+    keepalive_check = remote.get("keepalive_check") or {}
+    execution = remote.get("last_execution") or {}
+    if keepalive_check.get("state") in {"read_error", "unavailable", "error"}:
+        return with_countdown("Keepalive: quota check failed")
+    if execution.get("success") is False:
+        return with_countdown("Keepalive: quota check failed")
+    if keepalive.get("success") is True:
+        return with_countdown("Keepalive: last run succeeded")
+    if keepalive_check.get("state") == "waiting_reset":
+        return with_countdown("Keepalive: waiting for reset")
+    if keepalive_check.get("state") == "retry_wait":
+        return with_countdown("Keepalive: waiting for next check")
+    if keepalive_check.get("state") == "due":
+        return with_countdown("Keepalive: reset is due")
+
+    if execution.get("success") is True:
+        reset_state = execution.get("reset_state")
+        if reset_state == "passed":
+            return with_countdown("Keepalive: reset passed")
+        if reset_state == "waiting":
+            return with_countdown("Keepalive: reset pending")
+        if reset_state == "mixed":
+            return with_countdown("Keepalive: mixed reset windows")
+        if reset_state == "error":
+            return with_countdown("Keepalive: reset result unavailable")
+        return with_countdown("Keepalive: quota check succeeded")
+    if execution.get("success") is False:
+        return with_countdown("Keepalive: quota check failed")
+    return with_countdown("Keepalive: waiting for first quota check")
+
+
+def tray_hover_quota_lines(quota: dict, max_windows: int = 2) -> list[str]:
+    windows = quota.get("windows") if isinstance(quota, dict) else []
+    if not isinstance(windows, list):
+        return []
+
+    summaries = []
+    for window in windows:
+        if not isinstance(window, dict):
+            continue
+        label = safe_short(str(window.get("label") or window.get("key") or "quota"), 8)
+        remaining = format_percent_value(window.get("remaining_percent"))
+        if label and remaining:
+            countdown = window_reset_countdown(window)
+            summaries.append(
+                f"{label} {remaining}% {countdown}"
+                if countdown == "due"
+                else f"{label} {remaining}% in {countdown}"
+                if countdown
+                else f"{label} {remaining}%"
+            )
+        if len(summaries) >= max_windows:
+            break
+
+    return [f"Quota: {', '.join(summaries)}"] if summaries else []
 
 
 def truncate_tray_tooltip_lines(lines: list[str], limit: int = 120) -> str:
@@ -3246,12 +3845,22 @@ def truncate_tray_tooltip_lines(lines: list[str], limit: int = 120) -> str:
     return "\n".join(kept) or APP_NAME
 
 
-def tray_hover_title(attention: dict, quota: dict) -> str:
-    quota_lines = tray_quota_display_lines(quota, max_windows=3, no_quota_text="")
-    if not quota_lines:
+def tray_hover_title(
+    attention: dict, quota: dict, quota_keepalive_status: dict | None = None
+) -> str:
+    quota_keepalive_line = tray_hover_quota_keepalive_line(quota_keepalive_status)
+    quota_lines = (
+        tray_hover_quota_lines(quota)
+        if quota_keepalive_line
+        else tray_quota_display_lines(quota, max_windows=3, no_quota_text="")
+    )
+    if not quota_lines and not quota_keepalive_line:
         return tray_attention_title(attention)
 
-    lines = [APP_NAME, *quota_lines]
+    lines = [APP_NAME]
+    if quota_keepalive_line:
+        lines.append(quota_keepalive_line)
+    lines.extend(quota_lines)
     if attention.get("active"):
         title = tray_attention_title(attention)
         prefix = f"{APP_NAME}: "
@@ -3291,6 +3900,8 @@ def run_tray_attention_loop(
     last_notified_attention_id = ""
     last_quota = {}
     last_quota_refresh_at = 0.0
+    last_quota_keepalive_status = {"enabled": False}
+    last_quota_keepalive_refresh_at = -QUOTA_KEEPALIVE_MONITOR_INTERVAL_SECONDS
 
     while not stop_event.is_set():
         monotonic_now = time.monotonic()
@@ -3300,6 +3911,13 @@ def run_tray_attention_loop(
                 last_quota = latest_quota_for_display(refresh=True)
             except Exception:
                 last_quota = latest_quota_for_display(refresh=False)
+
+        if (
+            monotonic_now - last_quota_keepalive_refresh_at
+            >= QUOTA_KEEPALIVE_MONITOR_INTERVAL_SECONDS
+        ):
+            last_quota_keepalive_refresh_at = monotonic_now
+            last_quota_keepalive_status = codex_quota_keepalive_service_status()
 
         attention = current_attention()
         attention_id = attention.get("id") or ""
@@ -3321,7 +3939,7 @@ def run_tray_attention_loop(
             last_notified_attention_id = attention_id
 
         image_key = status if blink_on else "idle"
-        title = tray_hover_title(attention, last_quota)
+        title = tray_hover_title(attention, last_quota, last_quota_keepalive_status)
 
         if image_key != last_image_key:
             try:
@@ -3358,11 +3976,14 @@ def run_server_blocking(open_browser: bool, start_remote_control: bool = False) 
             )
         )
     quota_poller = start_quota_poller()
+    quota_keepalive_monitor = start_codex_quota_keepalive_monitor()
     try:
         app.run(host=HOST, port=PORT, debug=False, threaded=True)
     finally:
         if quota_poller:
             quota_poller.stop()
+        if quota_keepalive_monitor:
+            quota_keepalive_monitor.stop()
     return 0
 
 
@@ -3400,6 +4021,7 @@ def run_server_with_tray(
     server.start()
     print(f"Codex dashboard: {DASHBOARD_URL}")
     quota_poller = start_quota_poller()
+    quota_keepalive_monitor = start_codex_quota_keepalive_monitor()
 
     if open_browser:
         open_dashboard_browser()
@@ -3689,8 +4311,17 @@ def run_server_with_tray(
         quota_items = tuple(
             pystray.MenuItem(line, None, enabled=False)
             for line in tray_quota_display_lines(
-                latest_quota_for_display(refresh=False)
+                latest_quota_for_display(refresh=False),
+                include_reset_countdown=True,
             )
+        )
+        quota_keepalive_line = tray_quota_keepalive_status_line(
+            codex_quota_keepalive_service_status()
+        )
+        quota_keepalive_items = (
+            (pystray.MenuItem(quota_keepalive_line, None, enabled=False),)
+            if quota_keepalive_line
+            else ()
         )
         remote_item = pystray.MenuItem(
             remote_control_text,
@@ -3702,6 +4333,7 @@ def run_server_with_tray(
             pystray.MenuItem("Open Dashboard", on_open_dashboard, default=True),
             pystray.Menu.SEPARATOR,
             *quota_items,
+            *quota_keepalive_items,
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Test Alert", on_bell),
             remote_item,
@@ -3748,6 +4380,8 @@ def run_server_with_tray(
         attention_thread.join(timeout=2)
         if quota_poller:
             quota_poller.stop()
+        if quota_keepalive_monitor:
+            quota_keepalive_monitor.stop()
         server.shutdown()
         if exit_requested.is_set():
             os._exit(0)
@@ -3788,7 +4422,17 @@ def main() -> int:
         action="store_true",
         help="start codex remote-control in the background when the dashboard starts",
     )
+    parser.add_argument(
+        "--codex-quota-keepalive-url",
+        help=(
+            "monitor a Codex quota keepalive service at this URL "
+            f"(overrides {QUOTA_KEEPALIVE_SERVICE_URL_ENV})"
+        ),
+    )
     args = parser.parse_args()
+
+    if args.codex_quota_keepalive_url is not None:
+        os.environ[QUOTA_KEEPALIVE_SERVICE_URL_ENV] = args.codex_quota_keepalive_url
 
     if args.install_startup:
         install_startup(command_arguments)

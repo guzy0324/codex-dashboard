@@ -1,0 +1,5 @@
+# Monitor Codex quota keepalive over HTTP
+
+The Codex quota keepalive service runs as a separate Flask HTTP service on the server where the target account is logged in. It polls the 300-minute rate-limit window every ten minutes by default. When the cached reset time has passed, it runs `codex exec --ephemeral "Reply only OK"`, immediately reads rate limits again, and persists both the reset check and keepalive result. The local dashboard queries the service over HTTP for health and the latest execution result, avoiding a dependency on SSH. Both private/VPN and public-domain deployments use the same API. Bearer-token authentication is the default; an explicit no-auth mode is available for trusted private networks and VPNs. Public deployments must use token authentication or access control at the reverse proxy, with TLS terminated at the proxy. The dashboard's service URL is configurable so no network-specific application logic is needed.
+
+The service name describes its subject and action: it keeps Codex quota active. “Remote” is a deployment detail. The service entry point is `codex_quota_keepalive_service.py`.

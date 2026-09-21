@@ -16,6 +16,10 @@ The dashboard is intentionally in-memory. Restarting the server clears the page.
 - Detects manually interrupted turns from transcript events.
 - Shows remaining Codex quota from task hooks and, when the local Codex CLI is
   available, refreshes it through `codex app-server` once per minute.
+- Optionally monitors a remote Codex quota keepalive service over HTTP, showing service health,
+  the five-hour reset time, and the latest keepalive result.
+- In tray mode, includes remote quota keepalive status, quota, and reset countdowns in the
+  tooltip and context menu.
 - Plays a sound and flashes a visual reminder when a real Codex turn finishes.
 - Suppresses sound for internal title-generation turns.
 - Shows permission requests at the top of the page.
@@ -26,8 +30,9 @@ The dashboard is intentionally in-memory. Restarting the server clears the page.
 
 ## Requirements
 
-- Python 3.10+
+- Python 3.9+
 - Flask
+- Waitress for the Codex quota keepalive service
 - pystray and Pillow if you want the Windows notification-area icon
 - `curl` available in the shell running Codex hooks
 - a working `codex remote-control` command to toggle or automatically start Remote Control
@@ -165,6 +170,83 @@ item again to stop Remote Control in the background; it remains disabled as
 Background startup invokes the cross-platform `codex remote-control` command;
 Windows still uses no-console process creation flags. Set
 `CODEX_DASHBOARD_CODEX_CMD` to override the Codex CLI command used for launching.
+
+## Codex Quota Keepalive
+
+Run `codex_quota_keepalive_service.py` on the server where the target Codex CLI account is logged in. It uses the existing app-server rate-limit reader from `codex_dashboard.py` to check the 300-minute window every 10 minutes by default. If `resetAt` is still in the future, it only records the check. If `resetAt` has passed, it runs `codex exec --ephemeral "Reply only OK"`, immediately reads rate limits again, and saves the new reset time. The command makes a real Codex request and uses the account's quota; `--ephemeral` prevents the session from being persisted. The service persists its latest rate-limit check and keepalive result, and exposes both through its status API without sending notifications. Keep both Python files in the same directory.
+
+Configure the interval with `CODEX_QUOTA_KEEPALIVE_INTERVAL_SECONDS` (default `600`), the rate-limit request timeout with `CODEX_QUOTA_KEEPALIVE_REQUEST_TIMEOUT_SECONDS` (default `45`), and the Codex keepalive command timeout with `CODEX_QUOTA_KEEPALIVE_TIMEOUT_SECONDS` (default `120`). The longer rate-limit timeout allows Codex to refresh a cold model cache after a systemd restart. The dashboard and tray show whether the service and keepalive worker are running, plus the latest keepalive result.
+
+The server needs Python 3.9 or newer. Create a virtual environment and install the dependencies:
+
+```bash
+python3.9 --version
+python3.9 -m venv .venv
+source .venv/bin/activate
+python -m pip install flask waitress
+```
+
+Keep the project files in a stable directory on the server. The Codex CLI must be installed and logged in as the Linux account that will run the service. The systemd installer checks that the CLI exists before creating the unit. If it is outside systemd's default `PATH` (for example through `nvm`), pass its absolute path with `--codex-cmd`; the installer stores the resolved path in the environment file.
+
+For a manual launch, pass the bind address, port, and token as command-line arguments:
+
+```bash
+python codex_quota_keepalive_service.py --token '<generated-token>' --host 0.0.0.0 --port 18766
+```
+
+For a trusted private network or VPN, you can explicitly disable token authentication:
+
+```bash
+python codex_quota_keepalive_service.py --no-auth --host 0.0.0.0 --port 18766
+```
+
+Without authentication, every client that can reach the port can read the status. Do not expose this mode directly to the public internet. Use a token or access control at the reverse proxy for public deployments. When authentication is enabled, use `--token-file` to read the token from a restricted file. A value passed directly with `--token` is visible in process arguments. Command-line arguments override their corresponding environment variables; if omitted, the service still reads `CODEX_QUOTA_KEEPALIVE_TOKEN`, `CODEX_QUOTA_KEEPALIVE_HOST`, and `CODEX_QUOTA_KEEPALIVE_PORT`. Generate a token with `openssl rand -hex 32`.
+
+The service script can install and remove its own systemd unit. Replace `/opt/codex-dashboard` and `codex` with the project directory and Linux account on your server. The account must be logged into the Codex CLI. This command creates a systemd unit and a root-readable token environment file, then enables and starts the service:
+
+```bash
+sudo /opt/codex-dashboard/.venv/bin/python /opt/codex-dashboard/codex_quota_keepalive_service.py --install-systemd --service-user codex --codex-cmd /home/codex/.local/bin/codex --host 0.0.0.0
+sudo systemctl status codex-quota-keepalive
+sudo journalctl -u codex-quota-keepalive -f
+```
+
+The installer generates a token, saves it in `/etc/codex-quota-keepalive.env` with mode `600`, and prints it once. Save it for the local dashboard. The unit sets `HOME`, `CODEX_HOME`, and a service-user `PATH`. If the interactive Codex command relies on `HTTP_PROXY`, `HTTPS_PROXY`, or another shell-only environment variable, add the same setting to `/etc/codex-quota-keepalive.env` before restarting the unit. For a trusted private network or VPN, you can disable authentication explicitly with `--no-auth`; only do this when network access is restricted:
+
+Pass `--proxy http://proxy.example:7890` during installation to write the same proxy URL to the systemd environment for HTTP, HTTPS, and SOCKS requests. Use `--no-proxy host1,127.0.0.1` for bypasses. Proxy credentials, if included in the URL, are stored in the mode-600 environment file and may briefly appear in the install command's process list.
+
+```bash
+sudo /opt/codex-dashboard/.venv/bin/python /opt/codex-dashboard/codex_quota_keepalive_service.py --install-systemd --service-user codex --no-auth --host 0.0.0.0
+```
+
+For a public domain, bind to `127.0.0.1` and let a reverse proxy provide HTTPS and forward requests to port 18766. Both deployment modes use the same `/api/status` endpoint. To uninstall, run:
+
+```bash
+sudo /opt/codex-dashboard/.venv/bin/python /opt/codex-dashboard/codex_quota_keepalive_service.py --uninstall-systemd
+```
+
+Uninstalling stops and removes the systemd unit and its environment file. It leaves the project files and `/var/lib/codex-quota-keepalive` state and `/var/log/codex-quota-keepalive` log directories in place. The example files in `deploy/` remain available for manual systemd setup.
+
+Pass the remote URL directly when starting the local dashboard. No token is needed when the remote service uses no-auth mode:
+
+```powershell
+python codex_dashboard.py --codex-quota-keepalive-url "http://10.0.0.12:18766"
+```
+
+On Windows, add `--tray` to show the remote status in the tray tooltip and
+right-click menu:
+
+```powershell
+python codex_dashboard.py --tray --codex-quota-keepalive-url "http://10.0.0.12:18766"
+```
+
+If token authentication is enabled, set the same token in the dashboard environment before starting it. The URL can also be configured with `CODEX_DASHBOARD_QUOTA_KEEPALIVE_URL`:
+
+```powershell
+$env:CODEX_DASHBOARD_QUOTA_KEEPALIVE_TOKEN = "the-same-token-as-on-the-server"
+python codex_dashboard.py --codex-quota-keepalive-url "http://10.0.0.12:18766"
+```
+
+The dashboard backend checks the remote service every 30 seconds. Its optional monitor card shows HTTP reachability, service and rate-limit-poller status, the latest rate-limit read and keepalive results, and the five-hour reset state. The card stays hidden when no service URL is configured. Use an `https://` URL for public deployments.
 
 ## Codex Hook Config
 

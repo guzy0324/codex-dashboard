@@ -1,0 +1,21 @@
+[Unit]
+Description=Codex Quota Keepalive
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=codex
+WorkingDirectory=/opt/codex-dashboard
+EnvironmentFile=/etc/codex-quota-keepalive.env
+Environment=CODEX_DASHBOARD_SQLITE_HOME=/var/lib/codex-quota-keepalive/sqlite
+Environment=CODEX_DASHBOARD_QUOTA_LOG=/var/log/codex-quota-keepalive/quota.log
+ExecStart=/opt/codex-dashboard/.venv/bin/python /opt/codex-dashboard/codex_quota_keepalive_service.py
+Restart=on-failure
+RestartSec=5
+UMask=0077
+StateDirectory=codex-quota-keepalive
+LogsDirectory=codex-quota-keepalive
+
+[Install]
+WantedBy=multi-user.target
