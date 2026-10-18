@@ -323,7 +323,22 @@ Alternatively, set `CODEX_DASHBOARD_HOOK_CONFIG` to a custom config path.
 }
 ```
 
-Supported events are `user_prompt_submit`, `permission_request`, and `stop`.
+Supported events are `user_prompt_submit`, `permission_request`, `stop`, and `interrupt`.
+
+To report user interruptions, add this to Codex `config.toml` (adjust the path and machine name; on Windows use `python` and the local script path):
+
+```toml
+[[hooks.Interrupt]]
+
+[[hooks.Interrupt.hooks]]
+type = "command"
+command = "python3 /mdata/guzy0324/.codex/dashboard_hook.py interrupt labgpu"
+timeout = 3
+```
+
+Restart Codex after configuring the hook. It marks the current turn as `Interrupted`
+and clears its permission request without a completion notification. Older turn IDs
+are ignored. Interrupt hooks allow at most 3 seconds, so keep extra commands short.
 Commands under `*` run first for every event. Commands run sequentially after dashboard reporting,
 receive the enriched JSON payload on stdin, and get the event and machine through
 `CODEX_HOOK_ENDPOINT` and `CODEX_HOOK_MACHINE` environment variables.

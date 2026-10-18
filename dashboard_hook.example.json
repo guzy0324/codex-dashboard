@@ -2,6 +2,7 @@
   "commands": {
     "*": [],
     "user_prompt_submit": [],
+    "interrupt": [],
     "permission_request": [
       {
         "command": [

@@ -9,6 +9,44 @@ from unittest.mock import patch
 import codex_dashboard as dashboard
 
 
+class InterruptTests(unittest.TestCase):
+    def setUp(self):
+        self.session_id = "interrupt-test"
+        self.client = dashboard.app.test_client()
+
+    def tearDown(self):
+        dashboard.CONVERSATIONS.pop(self.session_id, None)
+
+    def test_interrupt_clears_permission_and_preserves_prompt(self):
+        payload = {"session_id": self.session_id, "turn_id": "current", "prompt": "Work"}
+        self.client.post("/api/codex/user_prompt_submit", json=payload)
+        dashboard.CONVERSATIONS[self.session_id]["permission"] = {"tool_name": "Bash"}
+        with patch.object(dashboard, "stop_dashboard_taskbar_flash_if_idle_async"):
+            response = self.client.post("/api/codex/interrupt", json=payload)
+        self.assertEqual(response.status_code, 200)
+        row = dashboard.CONVERSATIONS[self.session_id]
+        self.assertEqual(row["status"], "interrupted")
+        self.assertEqual(row["prompt"], "Work")
+        self.assertIsNone(row["permission"])
+        self.assertIsNotNone(row["finished_at"])
+
+    def test_old_interrupt_does_not_overwrite_new_turn(self):
+        self.client.post("/api/codex/user_prompt_submit", json={
+            "session_id": self.session_id, "turn_id": "new",
+        })
+        response = self.client.post("/api/codex/interrupt", json={
+            "session_id": self.session_id, "turn_id": "old",
+        })
+        self.assertTrue(response.get_json()["ignored"])
+        self.assertEqual(dashboard.CONVERSATIONS[self.session_id]["status"], "thinking")
+
+    def test_interrupt_without_submit_creates_visible_row(self):
+        with patch.object(dashboard, "stop_dashboard_taskbar_flash_if_idle_async"):
+            self.client.post("/api/codex/interrupt", json={"session_id": self.session_id})
+        item = dashboard.stored_to_item(dashboard.CONVERSATIONS[self.session_id])
+        self.assertEqual(item["status"], "interrupted")
+
+
 class QuotaDashboardTests(unittest.TestCase):
     def setUp(self):
         with dashboard.STORE_LOCK:

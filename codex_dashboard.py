@@ -2704,6 +2704,40 @@ def stop():
     return jsonify({"ok": True})
 
 
+@app.post("/api/codex/interrupt")
+def interrupt():
+    payload = request.get_json(force=True, silent=True) or {}
+    session_id = payload.get("session_id") or "unknown-session"
+    turn_id = payload.get("turn_id") or ""
+    t = now_ts()
+    with STORE_LOCK:
+        row = CONVERSATIONS.get(session_id)
+        if row and not is_current_turn(row, turn_id):
+            return jsonify({"ok": True, "ignored": True})
+        if row is None:
+            row = {
+                "session_id": session_id,
+                "created_at": t,
+                "started_at": None,
+                "turn_count": 0,
+                "prompt": "",
+                "last_assistant_message": "",
+            }
+            CONVERSATIONS[session_id] = row
+        for key in ("cwd", "model", "transcript_path"):
+            row[key] = payload.get(key) or row.get(key) or ""
+        row.update({
+            "status": "interrupted",
+            "current_turn_id": turn_id or row.get("current_turn_id") or "",
+            "machine": request_machine(payload) or row.get("machine") or "",
+            "updated_at": t,
+            "finished_at": t,
+            "permission": None,
+        })
+    stop_dashboard_taskbar_flash_if_idle_async()
+    return jsonify({"ok": True})
+
+
 @app.post("/api/codex/permission_request")
 def permission_request():
     payload = request.get_json(force=True, silent=True) or {}

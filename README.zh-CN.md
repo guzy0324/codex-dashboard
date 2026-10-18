@@ -281,7 +281,21 @@ command = "curl -fsS --max-time 2 -X POST -H 'Content-Type: application/json' -H
 }
 ```
 
-支持事件 `user_prompt_submit`、`permission_request`、`stop`；`*` 中的命令每次先执行。
+支持事件 `user_prompt_submit`、`permission_request`、`stop`、`interrupt`；`*` 中的命令每次先执行。
+
+在 Codex `config.toml` 中增加以下配置以报告用户中断（调整脚本路径和机器名；Windows 使用 `python` 和本地脚本路径）：
+
+```toml
+[[hooks.Interrupt]]
+
+[[hooks.Interrupt.hooks]]
+type = "command"
+command = "python3 /mdata/guzy0324/.codex/dashboard_hook.py interrupt labgpu"
+timeout = 3
+```
+
+配置后重启 Codex。中断会将当前回合标为 `Interrupted` 并清除权限请求，不发送完成通知。
+旧回合的中断事件会被忽略。Interrupt Hook 最多允许 3 秒，额外命令应保持简短。
 命令在 dashboard 上报后依次执行，通过 stdin 接收补充 quota 后的 JSON payload，
 通过环境变量 `CODEX_HOOK_ENDPOINT` 和 `CODEX_HOOK_MACHINE` 获取事件和机器名。
 `command` 是参数数组，不经 shell；需要 shell 语法时显式使用 `bash -lc` 或 `powershell -Command`。
