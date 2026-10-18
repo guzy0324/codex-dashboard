@@ -308,78 +308,30 @@ In that setup, put a helper on the remote host, for example
 `rate_limits` from the remote transcript and forwards the enriched payload to
 the dashboard:
 
-```python
-#!/usr/bin/env python3
-import json
-import os
-import subprocess
-import sys
-import time
+Copy the latest `dashboard_hook.py` from this repository to your hook location.
+Copy `dashboard_hook.example.json` beside it as `dashboard_hook.json` and replace the example command.
+Alternatively, set `CODEX_DASHBOARD_HOOK_CONFIG` to a custom config path.
 
-endpoint = sys.argv[1]
-machine = sys.argv[2]
-dashboard = os.environ.get("CODEX_DASHBOARD_URL", "http://127.0.0.1:18765").rstrip("/")
-
-payload = json.loads(sys.stdin.read() or "{}")
-transcript = payload.get("transcript_path") or ""
-
-
-def read_latest_rate_limits(path):
-    if not path or not os.path.isfile(path):
-        return None
-
-    size = os.path.getsize(path)
-    with open(path, "rb") as f:
-        if size > 1024 * 1024:
-            f.seek(-1024 * 1024, os.SEEK_END)
-        lines = f.read().decode("utf-8", "replace").splitlines()
-
-    latest = None
-    for line in lines:
-        try:
-            item = json.loads(line)
-        except Exception:
-            continue
-
-        payload = item.get("payload") if item.get("type") == "event_msg" else None
-        if isinstance(payload, dict) and isinstance(payload.get("rate_limits"), dict):
-            latest = payload["rate_limits"]
-
-    return latest
-
-
-rate_limits = None
-for _ in range(6 if endpoint == "stop" else 1):
-    rate_limits = read_latest_rate_limits(transcript)
-    if rate_limits:
-        break
-    time.sleep(0.15)
-
-if rate_limits:
-    payload["rate_limits"] = rate_limits
-
-subprocess.run(
-    [
-        "curl",
-        "-fsS",
-        "--max-time",
-        "2",
-        "-H",
-        "Content-Type: application/json",
-        "-H",
-        f"X-Codex-Machine: {machine}",
-        "--data-binary",
-        "@-",
-        f"{dashboard}/api/codex/{endpoint}",
-    ],
-    input=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-    stdout=subprocess.DEVNULL,
-    stderr=subprocess.DEVNULL,
-)
-
-if endpoint == "stop":
-    print('{"continue":true}')
+```json
+{
+  "commands": {
+    "*": [],
+    "stop": [
+      {"command": ["python3", "/absolute/path/to/on_done.py"], "timeout": 2}
+    ]
+  }
+}
 ```
+
+Supported events are `user_prompt_submit`, `permission_request`, and `stop`.
+Commands under `*` run first for every event. Commands run sequentially after dashboard reporting,
+receive the enriched JSON payload on stdin, and get the event and machine through
+`CODEX_HOOK_ENDPOINT` and `CODEX_HOOK_MACHINE` environment variables.
+`command` is an argument array without shell interpretation; invoke `bash -lc` or
+`powershell -Command` explicitly for shell syntax. `timeout` is in seconds (default 2, maximum 3600).
+Output is discarded; errors go to stderr. Failures do not prevent later commands or the Stop response.
+Increase the Codex hook timeout to cover reporting, quota retries, and all additional commands.
+Without a config file, existing behavior is preserved. Editing the config requires no hook command changes.
 
 Then change the three remote hook commands to:
 

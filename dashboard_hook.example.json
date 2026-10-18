@@ -1,0 +1,40 @@
+{
+  "commands": {
+    "*": [],
+    "user_prompt_submit": [],
+    "permission_request": [
+      {
+        "command": [
+          "curl",
+          "-v",
+          "--tlsv1.2",
+          "--tls-max",
+          "1.2",
+          "-X",
+          "POST",
+          "https://api.pushcut.io/YOUR_API_KEY/notifications/CodexDone",
+          "-d",
+          ""
+        ],
+        "timeout": 5
+      }
+    ],
+    "stop": [
+      {
+        "command": [
+          "curl",
+          "-v",
+          "--tlsv1.2",
+          "--tls-max",
+          "1.2",
+          "-X",
+          "POST",
+          "https://api.pushcut.io/YOUR_API_KEY/notifications/CodexDone",
+          "-d",
+          ""
+        ],
+        "timeout": 5
+      }
+    ]
+  }
+}

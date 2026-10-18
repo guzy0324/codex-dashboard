@@ -264,78 +264,30 @@ command = "curl -fsS --max-time 2 -X POST -H 'Content-Type: application/json' -H
 
 这种情况下，在远程主机放一个 helper，例如 `/mdata/guzy0324/.codex/dashboard_hook.py`，由 helper 在远程读取 transcript 里的最新 `rate_limits` 后再转发给 dashboard：
 
-```python
-#!/usr/bin/env python3
-import json
-import os
-import subprocess
-import sys
-import time
+将仓库中的最新版 `dashboard_hook.py` 复制到 hook 所用位置。
+将 `dashboard_hook.example.json` 复制到脚本同目录并重命名为 `dashboard_hook.json`，修改示例命令即可扩展。
+也可以用环境变量 `CODEX_DASHBOARD_HOOK_CONFIG` 指定配置路径。
 
-endpoint = sys.argv[1]
-machine = sys.argv[2]
-dashboard = os.environ.get("CODEX_DASHBOARD_URL", "http://127.0.0.1:18765").rstrip("/")
+配置示例：
 
-payload = json.loads(sys.stdin.read() or "{}")
-transcript = payload.get("transcript_path") or ""
-
-
-def read_latest_rate_limits(path):
-    if not path or not os.path.isfile(path):
-        return None
-
-    size = os.path.getsize(path)
-    with open(path, "rb") as f:
-        if size > 1024 * 1024:
-            f.seek(-1024 * 1024, os.SEEK_END)
-        lines = f.read().decode("utf-8", "replace").splitlines()
-
-    latest = None
-    for line in lines:
-        try:
-            item = json.loads(line)
-        except Exception:
-            continue
-
-        payload = item.get("payload") if item.get("type") == "event_msg" else None
-        if isinstance(payload, dict) and isinstance(payload.get("rate_limits"), dict):
-            latest = payload["rate_limits"]
-
-    return latest
-
-
-rate_limits = None
-for _ in range(6 if endpoint == "stop" else 1):
-    rate_limits = read_latest_rate_limits(transcript)
-    if rate_limits:
-        break
-    time.sleep(0.15)
-
-if rate_limits:
-    payload["rate_limits"] = rate_limits
-
-subprocess.run(
-    [
-        "curl",
-        "-fsS",
-        "--max-time",
-        "2",
-        "-H",
-        "Content-Type: application/json",
-        "-H",
-        f"X-Codex-Machine: {machine}",
-        "--data-binary",
-        "@-",
-        f"{dashboard}/api/codex/{endpoint}",
-    ],
-    input=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-    stdout=subprocess.DEVNULL,
-    stderr=subprocess.DEVNULL,
-)
-
-if endpoint == "stop":
-    print('{"continue":true}')
+```json
+{
+  "commands": {
+    "*": [],
+    "stop": [
+      {"command": ["python3", "/absolute/path/to/on_done.py"], "timeout": 2}
+    ]
+  }
+}
 ```
+
+支持事件 `user_prompt_submit`、`permission_request`、`stop`；`*` 中的命令每次先执行。
+命令在 dashboard 上报后依次执行，通过 stdin 接收补充 quota 后的 JSON payload，
+通过环境变量 `CODEX_HOOK_ENDPOINT` 和 `CODEX_HOOK_MACHINE` 获取事件和机器名。
+`command` 是参数数组，不经 shell；需要 shell 语法时显式使用 `bash -lc` 或 `powershell -Command`。
+`timeout` 单位为秒，默认 2，最大 3600。命令输出被丢弃，错误写入 stderr；失败后继续执行后续命令，Stop 仍输出 continue 响应。
+请将 Codex hook 自身的 timeout 调整为足以容纳上报、quota 重试及全部额外命令的时间。
+不放置配置文件时保持原有行为；修改 JSON 配置无需修改 hook command。
 
 然后把远程 Codex config 里的三条 hook command 改成：
 
