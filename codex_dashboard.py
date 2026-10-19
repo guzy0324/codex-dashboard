@@ -10,7 +10,6 @@ import os
 import platform
 import queue
 import shutil
-import signal
 import subprocess
 import sys
 import tempfile
@@ -19,8 +18,6 @@ import time
 import webbrowser
 import xml.etree.ElementTree as ET
 from datetime import datetime
-from urllib.error import HTTPError, URLError
-from urllib.request import Request, urlopen
 
 from flask import Flask, Response, jsonify, request
 from werkzeug.serving import make_server
@@ -41,10 +38,6 @@ STARTUP_CONTROL_ARGUMENTS = frozenset(
 TASK_XML_NAMESPACE = "http://schemas.microsoft.com/windows/2004/02/mit/task"
 MAX_ALERTS = 20
 VSCODE_CODEX_SIDEBAR_COMMAND = "chatgpt.openSidebar"
-CODEX_REMOTE_SUBCOMMAND = "remote-control"
-CODEX_REMOTE_MENU_LABEL = "Codex Remote Control"
-CODEX_REMOTE_START_TIMEOUT_SECONDS = 15.0
-CODEX_REMOTE_STOP_TIMEOUT_SECONDS = 15.0
 CODEX_APP_SERVER_CLIENT_NAME = "codex_dashboard"
 CODEX_SQLITE_HOME_ENV = "CODEX_SQLITE_HOME"
 CODEX_DASHBOARD_SQLITE_HOME_ENV = "CODEX_DASHBOARD_SQLITE_HOME"
@@ -53,10 +46,6 @@ QUOTA_REFRESH_INTERVAL_SECONDS = 60.0
 QUOTA_RETRY_BASE_SECONDS = 1.0
 QUOTA_RETRY_MAX_SECONDS = 60.0
 QUOTA_REQUEST_TIMEOUT_SECONDS = 15.0
-QUOTA_KEEPALIVE_SERVICE_URL_ENV = "CODEX_DASHBOARD_QUOTA_KEEPALIVE_URL"
-QUOTA_KEEPALIVE_SERVICE_TOKEN_ENV = "CODEX_DASHBOARD_QUOTA_KEEPALIVE_TOKEN"
-QUOTA_KEEPALIVE_MONITOR_INTERVAL_SECONDS = 30.0
-QUOTA_KEEPALIVE_MONITOR_TIMEOUT_SECONDS = 5.0
 QUOTA_LOG_PATH = os.path.abspath(
     (os.environ.get("CODEX_DASHBOARD_QUOTA_LOG") or "").strip()
     or os.path.join(PROJECT_DIR, "logs", "codex_dashboard_quota.log")
@@ -67,31 +56,10 @@ app = Flask(__name__)
 
 STORE_LOCK = threading.Lock()
 QUOTA_LOG_LOCK = threading.Lock()
-REMOTE_CONTROL_LOCK = threading.Lock()
-REMOTE_CONTROL_STATUS_LOCK = threading.Lock()
 CONVERSATIONS: dict[str, dict] = {}
 DONE_ALERTS: list[dict] = []
 TRANSCRIPT_QUOTA_CACHE: dict[str, dict] = {}
 ACCOUNT_QUOTA_CACHE: dict = {}
-REMOTE_CONTROL_STATUS_CACHE = {
-    "available": False,
-    "running": False,
-    "pids": [],
-    "error": "",
-    "loading": True,
-    "starting": False,
-    "starting_until": 0.0,
-    "stopping": False,
-    "stopping_until": 0.0,
-}
-QUOTA_KEEPALIVE_MONITOR_LOCK = threading.Lock()
-QUOTA_KEEPALIVE_MONITOR = None
-
-
-class RemoteControlProbeCancelled(Exception):
-    pass
-
-
 def now_ts() -> float:
     return time.time()
 
@@ -580,365 +548,6 @@ def codex_cli_command() -> str | None:
                     return command
 
     return None
-
-
-def cancellable_communicate(
-    process: subprocess.Popen, cancel_event: threading.Event | None
-):
-    if cancel_event is None:
-        return process.communicate()
-
-    while process.poll() is None:
-        if cancel_event.wait(0.05):
-            try:
-                process.terminate()
-            except OSError:
-                pass
-            try:
-                process.communicate(timeout=0.5)
-            except subprocess.TimeoutExpired:
-                try:
-                    process.kill()
-                except OSError:
-                    pass
-                process.communicate()
-            raise RemoteControlProbeCancelled()
-
-    return process.communicate()
-
-
-def process_rows(cancel_event: threading.Event | None = None) -> list[dict]:
-    if is_windows():
-        script = (
-            """Get-CimInstance Win32_Process -Filter "Name='codex.exe' OR Name='node.exe'" | """
-            "Select-Object ProcessId,Name,CommandLine | ConvertTo-Json -Compress"
-        )
-        arguments = [
-            "powershell.exe",
-            "-NoProfile",
-            "-NonInteractive",
-            "-Command",
-            script,
-        ]
-        try:
-            process = subprocess.Popen(
-                arguments,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
-        except OSError as exc:
-            raise RuntimeError(f"Unable to run {arguments[0]}: {exc}") from exc
-
-        stdout, stderr = cancellable_communicate(process, cancel_event)
-        result = subprocess.CompletedProcess(
-            arguments, process.returncode, stdout, stderr
-        )
-        if result.returncode != 0:
-            raise RuntimeError(f"Unable to inspect processes: {process_error(result)}")
-
-        text = decode_windows_output(result.stdout).lstrip("\ufeff").strip()
-        if not text:
-            return []
-        try:
-            rows = json.loads(text)
-        except ValueError as exc:
-            raise RuntimeError(
-                "Unable to inspect processes: invalid Windows process data"
-            ) from exc
-        return rows if isinstance(rows, list) else [rows]
-
-    try:
-        process = subprocess.Popen(
-            ["ps", "-eo", "pid=,comm=,args="],
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            text=True,
-        )
-    except OSError as exc:
-        raise RuntimeError(f"Unable to inspect processes: {exc}") from exc
-    stdout, stderr = cancellable_communicate(process, cancel_event)
-    result = subprocess.CompletedProcess(
-        ["ps", "-eo", "pid=,comm=,args="],
-        process.returncode,
-        stdout,
-        stderr,
-    )
-    if result.returncode != 0:
-        detail = (result.stderr or "").strip()
-        raise RuntimeError(
-            detail
-            or f"Unable to inspect processes: ps exited with status {result.returncode}"
-        )
-
-    rows = []
-    for line in (result.stdout or "").splitlines():
-        fields = line.strip().split(None, 2)
-        if len(fields) < 2:
-            continue
-        rows.append(
-            {
-                "ProcessId": fields[0],
-                "Name": fields[1],
-                "CommandLine": fields[2] if len(fields) > 2 else fields[1],
-            }
-        )
-    return rows
-
-
-def is_codex_remote_control_process(row: dict) -> bool:
-    process_name = os.path.basename(str(row.get("Name") or "")).lower()
-    command_line = str(row.get("CommandLine") or "").lower()
-    if CODEX_REMOTE_SUBCOMMAND not in command_line:
-        return False
-    if process_name in ("codex", "codex.exe"):
-        return True
-    return process_name in ("node", "node.exe") and (
-        "codex.js" in command_line or "@openai/codex" in command_line.replace("\\", "/")
-    )
-
-
-def codex_remote_control_status(cancel_event: threading.Event | None = None) -> dict:
-    command = codex_cli_command()
-    try:
-        processes = [
-            row
-            for row in process_rows(cancel_event)
-            if is_codex_remote_control_process(row)
-        ]
-    except RuntimeError as exc:
-        return {
-            "available": bool(command),
-            "running": False,
-            "pids": [],
-            "error": str(exc),
-        }
-
-    pids = []
-    for row in processes:
-        try:
-            pid = int(row.get("ProcessId") or 0)
-        except (TypeError, ValueError):
-            continue
-        if pid and pid not in pids:
-            pids.append(pid)
-
-    return {
-        "available": bool(command),
-        "running": bool(processes),
-        "pids": pids,
-        "error": "",
-    }
-
-
-def cached_codex_remote_control_status() -> dict:
-    with REMOTE_CONTROL_STATUS_LOCK:
-        clear_expired_codex_remote_control_transition_unlocked()
-        status = REMOTE_CONTROL_STATUS_CACHE.copy()
-        status["pids"] = list(REMOTE_CONTROL_STATUS_CACHE["pids"])
-        return status
-
-
-def clear_expired_codex_remote_control_transition_unlocked() -> None:
-    if (
-        REMOTE_CONTROL_STATUS_CACHE["starting"]
-        and REMOTE_CONTROL_STATUS_CACHE["starting_until"] <= time.monotonic()
-    ):
-        REMOTE_CONTROL_STATUS_CACHE["starting"] = False
-        REMOTE_CONTROL_STATUS_CACHE["starting_until"] = 0.0
-    if (
-        REMOTE_CONTROL_STATUS_CACHE["stopping"]
-        and REMOTE_CONTROL_STATUS_CACHE["stopping_until"] <= time.monotonic()
-    ):
-        REMOTE_CONTROL_STATUS_CACHE["stopping"] = False
-        REMOTE_CONTROL_STATUS_CACHE["stopping_until"] = 0.0
-
-
-def store_codex_remote_control_status(
-    status: dict,
-    finish_starting: bool = False,
-    finish_stopping: bool = False,
-) -> dict:
-    with REMOTE_CONTROL_STATUS_LOCK:
-        clear_expired_codex_remote_control_transition_unlocked()
-        running = bool(status.get("running"))
-        starting = REMOTE_CONTROL_STATUS_CACHE["starting"]
-        if running or finish_starting:
-            starting = False
-        stopping = REMOTE_CONTROL_STATUS_CACHE["stopping"]
-        if not running or finish_stopping:
-            stopping = False
-
-        REMOTE_CONTROL_STATUS_CACHE.update(
-            {
-                "available": bool(status.get("available")),
-                "running": running,
-                "pids": list(status.get("pids") or []),
-                "error": str(status.get("error") or ""),
-                "loading": False,
-                "starting": starting,
-                "starting_until": (
-                    REMOTE_CONTROL_STATUS_CACHE["starting_until"] if starting else 0.0
-                ),
-                "stopping": stopping,
-                "stopping_until": (
-                    REMOTE_CONTROL_STATUS_CACHE["stopping_until"] if stopping else 0.0
-                ),
-            }
-        )
-        stored = REMOTE_CONTROL_STATUS_CACHE.copy()
-        stored["pids"] = list(REMOTE_CONTROL_STATUS_CACHE["pids"])
-        return stored
-
-
-def mark_codex_remote_control_loading() -> None:
-    with REMOTE_CONTROL_STATUS_LOCK:
-        clear_expired_codex_remote_control_transition_unlocked()
-        REMOTE_CONTROL_STATUS_CACHE["loading"] = not (
-            REMOTE_CONTROL_STATUS_CACHE["starting"]
-            or REMOTE_CONTROL_STATUS_CACHE["stopping"]
-        )
-        REMOTE_CONTROL_STATUS_CACHE["error"] = ""
-
-
-def set_codex_remote_control_starting() -> bool:
-    with REMOTE_CONTROL_STATUS_LOCK:
-        clear_expired_codex_remote_control_transition_unlocked()
-        if (
-            REMOTE_CONTROL_STATUS_CACHE["starting"]
-            or REMOTE_CONTROL_STATUS_CACHE["stopping"]
-            or REMOTE_CONTROL_STATUS_CACHE["running"]
-        ):
-            return False
-        REMOTE_CONTROL_STATUS_CACHE["loading"] = False
-        REMOTE_CONTROL_STATUS_CACHE["error"] = ""
-        REMOTE_CONTROL_STATUS_CACHE["starting"] = True
-        REMOTE_CONTROL_STATUS_CACHE["starting_until"] = (
-            time.monotonic() + CODEX_REMOTE_START_TIMEOUT_SECONDS
-        )
-        return True
-
-
-def set_codex_remote_control_stopping() -> bool:
-    with REMOTE_CONTROL_STATUS_LOCK:
-        clear_expired_codex_remote_control_transition_unlocked()
-        if (
-            REMOTE_CONTROL_STATUS_CACHE["starting"]
-            or REMOTE_CONTROL_STATUS_CACHE["stopping"]
-            or not REMOTE_CONTROL_STATUS_CACHE["running"]
-        ):
-            return False
-        REMOTE_CONTROL_STATUS_CACHE["loading"] = False
-        REMOTE_CONTROL_STATUS_CACHE["error"] = ""
-        REMOTE_CONTROL_STATUS_CACHE["stopping"] = True
-        REMOTE_CONTROL_STATUS_CACHE["stopping_until"] = (
-            time.monotonic() + CODEX_REMOTE_STOP_TIMEOUT_SECONDS
-        )
-        return True
-
-
-def start_codex_remote_control(check_running: bool = True) -> None:
-    with REMOTE_CONTROL_LOCK:
-        if check_running:
-            status = codex_remote_control_status()
-            if status["error"]:
-                raise RuntimeError(status["error"])
-            if status["running"]:
-                return
-
-        command = codex_cli_command()
-        if not command:
-            raise RuntimeError("Codex CLI was not found in PATH")
-
-        kwargs = {
-            "stdin": subprocess.DEVNULL,
-            "stdout": subprocess.DEVNULL,
-            "stderr": subprocess.DEVNULL,
-        }
-        if is_windows():
-            kwargs["creationflags"] = (
-                getattr(subprocess, "CREATE_NO_WINDOW", 0)
-                | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
-                | getattr(subprocess, "DETACHED_PROCESS", 0)
-            )
-        else:
-            kwargs["start_new_session"] = True
-
-        try:
-            process = subprocess.Popen([command, CODEX_REMOTE_SUBCOMMAND], **kwargs)
-        except OSError as exc:
-            raise RuntimeError(f"Unable to start Codex Remote Control: {exc}") from exc
-
-        time.sleep(0.2)
-        returncode = process.poll()
-        if returncode is not None:
-            raise RuntimeError(
-                f"Codex Remote Control exited immediately with status {returncode}"
-            )
-
-
-def stop_codex_remote_control() -> None:
-    with REMOTE_CONTROL_LOCK:
-        status = codex_remote_control_status()
-        if status["error"]:
-            raise RuntimeError(status["error"])
-        if not status["running"]:
-            return
-
-        pids = [str(pid) for pid in status["pids"] if pid]
-        if not pids:
-            return
-
-        if is_windows():
-            arguments = ["taskkill.exe", "/T", "/F"]
-            for pid in pids:
-                arguments.extend(["/PID", pid])
-            result = run_windows_process(arguments)
-            if result.returncode != 0:
-                remaining = codex_remote_control_status()
-                if remaining["running"]:
-                    raise RuntimeError(
-                        f"Unable to stop Codex Remote Control: {process_error(result)}"
-                    )
-            return
-
-        for pid in pids:
-            try:
-                os.kill(int(pid), signal.SIGTERM)
-            except ProcessLookupError:
-                continue
-            except OSError as exc:
-                raise RuntimeError(
-                    f"Unable to stop Codex Remote Control: {exc}"
-                ) from exc
-
-
-def start_codex_remote_control_async(
-    check_running: bool = True,
-    on_error=None,
-) -> bool:
-    if not set_codex_remote_control_starting():
-        return False
-
-    def _start() -> None:
-        error = ""
-        try:
-            start_codex_remote_control(check_running=check_running)
-            status = codex_remote_control_status()
-        except RuntimeError as exc:
-            error = str(exc)
-            status = {
-                "available": bool(codex_cli_command()),
-                "running": False,
-                "pids": [],
-                "error": error,
-            }
-        store_codex_remote_control_status(status, finish_starting=bool(error))
-        if error and on_error:
-            on_error(error)
-
-    run_daemon_thread(_start)
-    return True
 
 
 def safe_short(text: str | None, limit: int = 300) -> str:
@@ -2173,148 +1782,6 @@ class CodexQuotaPoller:
                 pass
 
 
-class CodexQuotaKeepaliveMonitor:
-    """Poll the configured Codex quota keepalive endpoint and cache its status."""
-
-    def __init__(
-        self,
-        url: str,
-        token: str,
-        interval_seconds: float = QUOTA_KEEPALIVE_MONITOR_INTERVAL_SECONDS,
-        request_timeout_seconds: float = QUOTA_KEEPALIVE_MONITOR_TIMEOUT_SECONDS,
-    ) -> None:
-        self._url = url.rstrip("/")
-        self._token = token
-        self._interval_seconds = interval_seconds
-        self._request_timeout_seconds = request_timeout_seconds
-        self._stop_event = threading.Event()
-        self._thread: threading.Thread | None = None
-        self._status_lock = threading.Lock()
-        self._status = {
-            "enabled": True,
-            "reachable": False,
-            "authenticated": False,
-            "checked_at": None,
-            "remote": None,
-            "error": "Waiting for the first status check",
-        }
-
-    def start(self) -> None:
-        if self._thread and self._thread.is_alive():
-            return
-        self._thread = threading.Thread(
-            target=self._run,
-            name="codex-dashboard-quota-keepalive-monitor",
-            daemon=True,
-        )
-        self._thread.start()
-
-    def stop(self) -> None:
-        self._stop_event.set()
-        if self._thread and self._thread is not threading.current_thread():
-            self._thread.join(timeout=2)
-
-    def snapshot(self) -> dict:
-        with self._status_lock:
-            return json.loads(json.dumps(self._status, ensure_ascii=False))
-
-    def _run(self) -> None:
-        while not self._stop_event.is_set():
-            self._check_once()
-            if self._stop_event.wait(self._interval_seconds):
-                break
-
-    def _check_once(self) -> None:
-        checked_at = now_ts()
-        headers = {}
-        if self._token:
-            headers["Authorization"] = f"Bearer {self._token}"
-        req = Request(
-            f"{self._url}/api/status",
-            headers=headers,
-            method="GET",
-        )
-        try:
-            with urlopen(req, timeout=self._request_timeout_seconds) as response:
-                remote_status = json.loads(response.read().decode("utf-8"))
-            if not isinstance(remote_status, dict):
-                raise ValueError("Keepalive API returned a non-object status")
-            self._store_status(
-                reachable=True,
-                authenticated=True,
-                checked_at=checked_at,
-                remote=remote_status,
-                error="",
-            )
-        except HTTPError as exc:
-            self._store_status(
-                reachable=True,
-                authenticated=False,
-                checked_at=checked_at,
-                remote=None,
-                error=f"HTTP {exc.code}: {exc.reason}",
-            )
-        except (URLError, TimeoutError, OSError, ValueError) as exc:
-            self._store_status(
-                reachable=False,
-                authenticated=False,
-                checked_at=checked_at,
-                remote=None,
-                error=f"{type(exc).__name__}: {exc}",
-            )
-        except Exception as exc:
-            self._store_status(
-                reachable=False,
-                authenticated=False,
-                checked_at=checked_at,
-                remote=None,
-                error=f"{type(exc).__name__}: {exc}",
-            )
-
-    def _store_status(
-        self,
-        reachable: bool,
-        authenticated: bool,
-        checked_at: float,
-        remote: dict | None,
-        error: str,
-    ) -> None:
-        with self._status_lock:
-            if remote is None:
-                remote = self._status.get("remote")
-            self._status = {
-                "enabled": True,
-                "reachable": reachable,
-                "authenticated": authenticated,
-                "checked_at": checked_at,
-                "remote": remote,
-                "error": error,
-            }
-
-
-def start_codex_quota_keepalive_monitor() -> CodexQuotaKeepaliveMonitor | None:
-    global QUOTA_KEEPALIVE_MONITOR
-
-    url = (os.environ.get(QUOTA_KEEPALIVE_SERVICE_URL_ENV) or "").strip()
-    if not url:
-        return None
-
-    token = (os.environ.get(QUOTA_KEEPALIVE_SERVICE_TOKEN_ENV) or "").strip()
-    monitor = CodexQuotaKeepaliveMonitor(url, token)
-    with QUOTA_KEEPALIVE_MONITOR_LOCK:
-        QUOTA_KEEPALIVE_MONITOR = monitor
-    monitor.start()
-    return monitor
-
-
-def codex_quota_keepalive_service_status() -> dict:
-    with QUOTA_KEEPALIVE_MONITOR_LOCK:
-        monitor = QUOTA_KEEPALIVE_MONITOR
-    if not monitor:
-        return {"enabled": False}
-    return monitor.snapshot()
-
-
 def start_quota_poller() -> CodexQuotaPoller | None:
     command = codex_cli_command()
     quota_log(
@@ -2868,11 +2335,6 @@ def quota():
         return jsonify(latest_quota_summary_unlocked())
 
 
-@app.get("/api/codex_quota_keepalive")
-def codex_quota_keepalive():
-    return jsonify(codex_quota_keepalive_service_status())
-
-
 @app.get("/")
 def index():
     return """
@@ -3085,7 +2547,6 @@ def index():
   <h1>Codex Dashboard</h1>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <div id="quota" class="quota-strip"></div>
-  <div id="codex-quota-keepalive"></div>
   <div id="alerts" class="alerts"></div>
   <div id="list"></div>
 
@@ -3100,25 +2561,22 @@ let doneAckTimer = null;
 let toastTimer = null;
 
 async function load() {
-  const [alertRes, attentionRes, conversationRes, quotaRes, quotaKeepaliveRes] = await Promise.all([
+  const [alertRes, attentionRes, conversationRes, quotaRes] = await Promise.all([
     fetch('/api/permission_requests'),
     fetch('/api/attention'),
     fetch('/api/conversations'),
-    fetch('/api/quota'),
-    fetch('/api/codex_quota_keepalive')
+    fetch('/api/quota')
   ]);
   const alerts = await alertRes.json();
   const attention = await attentionRes.json();
   const items = await conversationRes.json();
   const accountQuota = await quotaRes.json();
-  const quotaKeepaliveStatus = await quotaKeepaliveRes.json();
 
   const alertList = document.getElementById('alerts');
   const list = document.getElementById('list');
   alertList.innerHTML = alerts.map(renderAlert).join('');
   updateAttention(attention);
   renderQuota(items, accountQuota);
-  renderCodexQuotaKeepalive(quotaKeepaliveStatus);
 
   if (!items.length) {
     list.innerHTML = '<div class="muted">No Codex events in this run yet.</div>';
@@ -3156,129 +2614,6 @@ async function load() {
       </div>
     `;
   }).join('');
-}
-
-function renderCodexQuotaKeepalive(status) {
-  const container = document.getElementById('codex-quota-keepalive');
-  if (!container || !status || !status.enabled) {
-    if (container) {
-      container.innerHTML = '';
-    }
-    return;
-  }
-
-  const reachable = Boolean(status.reachable);
-  const authenticated = Boolean(status.authenticated);
-  const remote = status.remote || {};
-  const execution = remote.last_execution || {};
-  const keepalive = remote.last_keepalive || {};
-  const keepaliveCheck = remote.keepalive_check || {};
-  const hasKeepaliveStatus = Object.prototype.hasOwnProperty.call(remote, 'last_keepalive');
-  const pollerRunning = Boolean(remote.rate_limit_poller_running);
-  let badgeClass = 'thinking';
-  let badgeText = 'Waiting for first check';
-
-  if (!reachable) {
-    badgeClass = 'interrupted';
-    badgeText = 'HTTP service unavailable';
-  } else if (!authenticated) {
-    badgeClass = 'permission';
-    badgeText = 'Status API error';
-  } else if (!pollerRunning) {
-    badgeClass = 'interrupted';
-    badgeText = 'Reset poller stopped';
-  } else if (hasKeepaliveStatus && !remote.keepalive_worker_running) {
-    badgeClass = 'interrupted';
-    badgeText = 'Keepalive worker stopped';
-  } else if (keepalive.state === 'running') {
-    badgeClass = 'thinking';
-    badgeText = 'Keepalive running';
-  } else if (keepalive.success === false) {
-    badgeClass = 'permission';
-    badgeText = 'Last keepalive failed';
-  } else if (execution.success === false) {
-    badgeClass = 'permission';
-    badgeText = 'Rate-limit check failed';
-  } else if (keepalive.success === true) {
-    badgeClass = 'done';
-    badgeText = 'Service running';
-  } else if (execution.success === true) {
-    badgeClass = 'done';
-    badgeText = 'Service running';
-  }
-
-  let resetText = 'No five-hour reset result yet';
-  if (execution.reset_state === 'passed') {
-    resetText = 'Reset time has passed';
-  } else if (execution.reset_state === 'waiting') {
-    resetText = 'Reset time is in the future';
-  } else if (execution.reset_state === 'mixed') {
-    resetText = 'Reset windows have mixed states';
-  } else if (execution.reset_state === 'error') {
-    resetText = 'Reset status unavailable';
-  }
-
-  const checkedAt = formatTimestamp(status.checked_at);
-  const executionAt = formatTimestamp(execution.checked_at);
-  const keepaliveAt = formatTimestamp(keepalive.finished_at || keepalive.started_at);
-  const keepaliveCheckAt = formatTimestamp(keepaliveCheck.checked_at);
-  const keepaliveStatusText = keepalive.state === 'running'
-    ? 'running'
-    : keepalive.success === true
-      ? 'last run succeeded'
-      : keepalive.success === false
-        ? 'last run failed'
-        : 'not run yet';
-  const keepaliveCheckText = keepaliveCheck.state === 'waiting_reset'
-    ? 'waiting for reset time'
-    : keepaliveCheck.state === 'due'
-      ? 'reset time passed'
-      : keepaliveCheck.state === 'retry_wait'
-        ? 'waiting for the next check interval'
-        : keepaliveCheck.state === 'read_error' || keepaliveCheck.state === 'unavailable' || keepaliveCheck.state === 'error'
-          ? 'reset check unavailable'
-          : '';
-  const resetWindows = Array.isArray(execution.reset_windows)
-    ? execution.reset_windows
-    : [];
-  const resetWindowText = resetWindows.map(window => {
-    const windowState = window.reset_state === 'passed' ? 'passed' : 'waiting';
-    return `${window.label || '5h'}: ${windowState}`;
-  }).join(', ');
-  const resetAtText = resetWindows.map(window => {
-    const timestamp = formatTimestamp(window.reset_at);
-    return timestamp ? `${window.label || '5h'}: ${timestamp}` : '';
-  }).filter(Boolean).join(', ');
-  const resetAt = resetAtText || formatTimestamp(execution.reset_at);
-  const error = !authenticated
-    ? status.error
-    : keepalive.success === false && keepalive.error
-      ? keepalive.error
-      : keepaliveCheck.error || execution.error;
-  container.innerHTML = `
-    <div class="card">
-      <div class="row">
-        <span class="badge ${badgeClass}">${escapeHtml(badgeText)}</span>
-        <span>Codex Quota Keepalive</span>
-      </div>
-      <div class="row muted">
-        <span>HTTP: ${reachable ? 'reachable' : 'unreachable'}</span>
-        ${reachable ? `<span>status API: ${authenticated ? 'ok' : 'error'}</span>` : ''}
-        ${remote.service_running ? '<span>service: running</span>' : ''}
-        ${checkedAt ? `<span>dashboard checked: ${escapeHtml(checkedAt)}</span>` : ''}
-        ${executionAt ? `<span>last rate-limit read: ${escapeHtml(executionAt)}</span>` : ''}
-        ${hasKeepaliveStatus ? `<span>keepalive: ${escapeHtml(keepaliveStatusText)}</span>` : ''}
-        ${hasKeepaliveStatus && keepaliveAt ? `<span>last keepalive: ${escapeHtml(keepaliveAt)}</span>` : ''}
-        ${keepaliveCheckAt ? `<span>reset checked: ${escapeHtml(keepaliveCheckAt)}</span>` : ''}
-        ${keepaliveCheckText ? `<span>next action: ${escapeHtml(keepaliveCheckText)}</span>` : ''}
-        ${keepalive.reset_at_before ? `<span>reset before keepalive: ${escapeHtml(formatTimestamp(keepalive.reset_at_before))}</span>` : ''}
-        ${keepalive.reset_at_after ? `<span>reset after keepalive: ${escapeHtml(formatTimestamp(keepalive.reset_at_after))}</span>` : ''}
-        <span>5-hour window: ${escapeHtml(resetWindowText || resetText)}</span>
-        ${resetAt ? `<span>reset at: ${escapeHtml(resetAt)}</span>` : ''}
-      </div>
-      ${error ? `<div class="muted">Error: ${escapeHtml(error)}</div>` : ''}
-    </div>
-  `;
 }
 
 function renderQuota(items, accountQuota) {
@@ -3350,14 +2685,6 @@ function formatPercent(value) {
 
   const rounded = Math.round(num * 10) / 10;
   return Number.isInteger(rounded) ? String(rounded) : rounded.toFixed(1);
-}
-
-function formatTimestamp(value) {
-  const timestamp = Number(value);
-  if (!Number.isFinite(timestamp) || timestamp <= 0) {
-    return '';
-  }
-  return new Date(timestamp * 1000).toLocaleString();
 }
 
 function clampNumber(value, min, max) {
@@ -3698,165 +3025,6 @@ def tray_quota_display_lines(
     return lines or ([no_quota_text] if no_quota_text else [])
 
 
-def tray_quota_keepalive_countdown(remote: dict) -> str:
-    execution = remote.get("last_execution") or {}
-    windows = execution.get("reset_windows") or []
-    if not isinstance(windows, list):
-        return ""
-    for window in windows:
-        if not isinstance(window, dict):
-            continue
-        reset_at = coerce_event_timestamp(window.get("reset_at"))
-        countdown = reset_countdown_text(reset_at)
-        if countdown:
-            return "reset due" if countdown == "due" else f"reset in {countdown}"
-    return ""
-
-
-def tray_quota_keepalive_status_line(status: dict | None) -> str:
-    if not isinstance(status, dict) or not status.get("enabled"):
-        return ""
-    if not status.get("reachable"):
-        return "Keepalive: unavailable"
-    if not status.get("authenticated"):
-        return "Keepalive API: error"
-
-    remote = status.get("remote") or {}
-    if not remote.get("service_running"):
-        return "Keepalive: stopped"
-    if not remote.get("rate_limit_poller_running"):
-        return "Keepalive poller: stopped"
-
-    countdown = tray_quota_keepalive_countdown(remote)
-
-    def with_countdown(line: str) -> str:
-        return f"{line}; {countdown}" if countdown else line
-
-    has_keepalive_status = "last_keepalive" in remote
-    keepalive = remote.get("last_keepalive") or {}
-    if has_keepalive_status and not remote.get("keepalive_worker_running"):
-        return with_countdown("Keepalive: worker stopped")
-    if keepalive.get("state") == "running":
-        return with_countdown("Keepalive: running")
-    if keepalive.get("success") is False:
-        return with_countdown("Keepalive: last run failed")
-
-    keepalive_check = remote.get("keepalive_check") or {}
-    execution = remote.get("last_execution") or {}
-    if keepalive_check.get("state") in {"read_error", "unavailable", "error"}:
-        return with_countdown("Keepalive: quota check failed")
-    if execution.get("success") is False:
-        return with_countdown("Keepalive: quota check failed")
-    if keepalive.get("success") is True:
-        return with_countdown("Keepalive: last run succeeded")
-    if keepalive_check.get("state") == "waiting_reset":
-        return with_countdown("Keepalive: waiting for reset")
-    if keepalive_check.get("state") == "retry_wait":
-        return with_countdown("Keepalive: waiting for next check")
-    if keepalive_check.get("state") == "due":
-        return with_countdown("Keepalive: reset is due")
-
-    if execution.get("success") is True:
-        reset_state = execution.get("reset_state")
-        if reset_state == "passed":
-            return with_countdown("Keepalive: reset passed")
-        if reset_state == "waiting":
-            return with_countdown("Keepalive: reset pending")
-        if reset_state == "mixed":
-            return with_countdown("Keepalive: reset windows mixed")
-        if reset_state == "error":
-            return with_countdown("Keepalive: reset result unavailable")
-        return with_countdown("Keepalive: quota check succeeded")
-    if execution.get("success") is False:
-        return with_countdown("Keepalive: quota check failed")
-    return with_countdown("Keepalive: waiting for first quota check")
-
-
-def tray_hover_quota_keepalive_line(status: dict | None) -> str:
-    if not isinstance(status, dict) or not status.get("enabled"):
-        return ""
-    if not status.get("reachable"):
-        return "Keepalive: offline"
-    if not status.get("authenticated"):
-        return "Keepalive API: error"
-
-    remote = status.get("remote") or {}
-    if not remote.get("service_running"):
-        return "Keepalive: stopped"
-    if not remote.get("rate_limit_poller_running"):
-        return "Keepalive poller: stopped"
-
-    countdown = tray_quota_keepalive_countdown(remote)
-
-    def with_countdown(line: str) -> str:
-        return f"{line}; {countdown}" if countdown else line
-
-    has_keepalive_status = "last_keepalive" in remote
-    keepalive = remote.get("last_keepalive") or {}
-    if has_keepalive_status and not remote.get("keepalive_worker_running"):
-        return with_countdown("Keepalive: worker stopped")
-    if keepalive.get("state") == "running":
-        return with_countdown("Keepalive: running")
-    if keepalive.get("success") is False:
-        return with_countdown("Keepalive: last run failed")
-
-    keepalive_check = remote.get("keepalive_check") or {}
-    execution = remote.get("last_execution") or {}
-    if keepalive_check.get("state") in {"read_error", "unavailable", "error"}:
-        return with_countdown("Keepalive: quota check failed")
-    if execution.get("success") is False:
-        return with_countdown("Keepalive: quota check failed")
-    if keepalive.get("success") is True:
-        return with_countdown("Keepalive: last run succeeded")
-    if keepalive_check.get("state") == "waiting_reset":
-        return with_countdown("Keepalive: waiting for reset")
-    if keepalive_check.get("state") == "retry_wait":
-        return with_countdown("Keepalive: waiting for next check")
-    if keepalive_check.get("state") == "due":
-        return with_countdown("Keepalive: reset is due")
-
-    if execution.get("success") is True:
-        reset_state = execution.get("reset_state")
-        if reset_state == "passed":
-            return with_countdown("Keepalive: reset passed")
-        if reset_state == "waiting":
-            return with_countdown("Keepalive: reset pending")
-        if reset_state == "mixed":
-            return with_countdown("Keepalive: mixed reset windows")
-        if reset_state == "error":
-            return with_countdown("Keepalive: reset result unavailable")
-        return with_countdown("Keepalive: quota check succeeded")
-    if execution.get("success") is False:
-        return with_countdown("Keepalive: quota check failed")
-    return with_countdown("Keepalive: waiting for first quota check")
-
-
-def tray_hover_quota_lines(quota: dict, max_windows: int = 2) -> list[str]:
-    windows = quota.get("windows") if isinstance(quota, dict) else []
-    if not isinstance(windows, list):
-        return []
-
-    summaries = []
-    for window in windows:
-        if not isinstance(window, dict):
-            continue
-        label = safe_short(str(window.get("label") or window.get("key") or "quota"), 8)
-        remaining = format_percent_value(window.get("remaining_percent"))
-        if label and remaining:
-            countdown = window_reset_countdown(window)
-            summaries.append(
-                f"{label} {remaining}% {countdown}"
-                if countdown == "due"
-                else f"{label} {remaining}% in {countdown}"
-                if countdown
-                else f"{label} {remaining}%"
-            )
-        if len(summaries) >= max_windows:
-            break
-
-    return [f"Quota: {', '.join(summaries)}"] if summaries else []
-
-
 def truncate_tray_tooltip_lines(lines: list[str], limit: int = 120) -> str:
     kept = []
     used = 0
@@ -3879,29 +3047,17 @@ def truncate_tray_tooltip_lines(lines: list[str], limit: int = 120) -> str:
     return "\n".join(kept) or APP_NAME
 
 
-def tray_hover_title(
-    attention: dict, quota: dict, quota_keepalive_status: dict | None = None
-) -> str:
-    quota_keepalive_line = tray_hover_quota_keepalive_line(quota_keepalive_status)
-    quota_lines = (
-        tray_hover_quota_lines(quota)
-        if quota_keepalive_line
-        else tray_quota_display_lines(quota, max_windows=3, no_quota_text="")
-    )
-    if not quota_lines and not quota_keepalive_line:
+def tray_hover_title(attention: dict, quota: dict) -> str:
+    quota_lines = tray_quota_display_lines(quota, max_windows=3, no_quota_text="")
+    if not quota_lines:
         return tray_attention_title(attention)
-
-    lines = [APP_NAME]
-    if quota_keepalive_line:
-        lines.append(quota_keepalive_line)
-    lines.extend(quota_lines)
+    lines = [APP_NAME, *quota_lines]
     if attention.get("active"):
         title = tray_attention_title(attention)
         prefix = f"{APP_NAME}: "
-        attention_part = title[len(prefix) :] if title.startswith(prefix) else title
+        attention_part = title[len(prefix):] if title.startswith(prefix) else title
         if attention_part and attention_part != APP_NAME:
             lines.append(safe_short(attention_part, 60))
-
     return truncate_tray_tooltip_lines(lines)
 
 
@@ -3934,8 +3090,6 @@ def run_tray_attention_loop(
     last_notified_attention_id = ""
     last_quota = {}
     last_quota_refresh_at = 0.0
-    last_quota_keepalive_status = {"enabled": False}
-    last_quota_keepalive_refresh_at = -QUOTA_KEEPALIVE_MONITOR_INTERVAL_SECONDS
 
     while not stop_event.is_set():
         monotonic_now = time.monotonic()
@@ -3945,13 +3099,6 @@ def run_tray_attention_loop(
                 last_quota = latest_quota_for_display(refresh=True)
             except Exception:
                 last_quota = latest_quota_for_display(refresh=False)
-
-        if (
-            monotonic_now - last_quota_keepalive_refresh_at
-            >= QUOTA_KEEPALIVE_MONITOR_INTERVAL_SECONDS
-        ):
-            last_quota_keepalive_refresh_at = monotonic_now
-            last_quota_keepalive_status = codex_quota_keepalive_service_status()
 
         attention = current_attention()
         attention_id = attention.get("id") or ""
@@ -3973,7 +3120,7 @@ def run_tray_attention_loop(
             last_notified_attention_id = attention_id
 
         image_key = status if blink_on else "idle"
-        title = tray_hover_title(attention, last_quota, last_quota_keepalive_status)
+        title = tray_hover_title(attention, last_quota)
 
         if image_key != last_image_key:
             try:
@@ -3998,39 +3145,28 @@ def run_tray_attention_loop(
         pass
 
 
-def run_server_blocking(open_browser: bool, start_remote_control: bool = False) -> int:
+def run_server_blocking(open_browser: bool) -> int:
     print(f"Codex dashboard: {DASHBOARD_URL}")
     if open_browser:
         open_dashboard_browser()
-    if start_remote_control:
-        start_codex_remote_control_async(
-            on_error=lambda error: print(
-                f"Could not start Codex Remote Control: {error}",
-                file=sys.stderr,
-            )
-        )
     quota_poller = start_quota_poller()
-    quota_keepalive_monitor = start_codex_quota_keepalive_monitor()
     try:
         app.run(host=HOST, port=PORT, debug=False, threaded=True)
     finally:
         if quota_poller:
             quota_poller.stop()
-        if quota_keepalive_monitor:
-            quota_keepalive_monitor.stop()
     return 0
 
 
 def run_server_with_tray(
     open_browser: bool,
-    start_remote_control: bool = False,
     startup_arguments: list[str] | None = None,
 ) -> int:
     if not is_windows():
         print(
             "Tray mode is currently only supported on Windows; falling back to normal service mode."
         )
-        return run_server_blocking(open_browser, start_remote_control)
+        return run_server_blocking(open_browser)
 
     try:
         import ctypes
@@ -4055,7 +3191,6 @@ def run_server_with_tray(
     server.start()
     print(f"Codex dashboard: {DASHBOARD_URL}")
     quota_poller = start_quota_poller()
-    quota_keepalive_monitor = start_codex_quota_keepalive_monitor()
 
     if open_browser:
         open_dashboard_browser()
@@ -4065,19 +3200,6 @@ def run_server_with_tray(
     tray_activate_events = {pystray_win32.WM_LBUTTONUP, 0x0203}
     tray_context_menu_event = getattr(pystray_win32, "WM_RBUTTONUP", 0x0205)
     tray_open_cooldown_seconds = 0.75
-    remote_menu_item_id = {"value": 0}
-    set_menu_item_info = ctypes.windll.user32.SetMenuItemInfoW
-    set_menu_item_info.argtypes = (
-        wintypes.HMENU,
-        wintypes.UINT,
-        wintypes.BOOL,
-        ctypes.POINTER(pystray_win32.MENUITEMINFO),
-    )
-    set_menu_item_info.restype = wintypes.BOOL
-    draw_menu_bar = ctypes.windll.user32.DrawMenuBar
-    draw_menu_bar.argtypes = (wintypes.HWND,)
-    draw_menu_bar.restype = wintypes.BOOL
-
     class DashboardTrayIcon(pystray.Icon):
         def __init__(
             self, *args, notification_click=None, tray_activate=None, **kwargs
@@ -4085,10 +3207,6 @@ def run_server_with_tray(
             self._notification_click = notification_click
             self._tray_activate = tray_activate
             self._last_tray_open_at = 0.0
-            self._remote_probe_lock = threading.Lock()
-            self._remote_probe_id = 0
-            self._remote_probe_cancel = None
-            self._remote_menu_open = False
             super().__init__(*args, **kwargs)
 
         def _handle_callback(self, callback) -> None:
@@ -4103,104 +3221,25 @@ def run_server_with_tray(
             self._last_tray_open_at = opened_at
             self._handle_callback(self._tray_activate)
 
-        def _update_open_remote_item(self, probe_id: int, status: dict) -> None:
-            with self._remote_probe_lock:
-                if probe_id != self._remote_probe_id or not self._remote_menu_open:
-                    return
-                menu_handle = self._menu_handle
-
-            command_id = remote_menu_item_id["value"]
-            if not menu_handle or not command_id:
-                return
-
-            checked = remote_control_checked_value(status)
-            state = (
-                pystray_win32.MFS_CHECKED if checked else pystray_win32.MFS_UNCHECKED
-            )
-            if not remote_control_enabled_value(status):
-                state |= pystray_win32.MFS_DISABLED
-
-            menu_item = pystray_win32.MENUITEMINFO(
-                cbSize=ctypes.sizeof(pystray_win32.MENUITEMINFO),
-                fMask=pystray_win32.MIIM_STRING | pystray_win32.MIIM_STATE,
-                dwTypeData=remote_control_text_value(status),
-                fState=state,
-            )
-            try:
-                set_menu_item_info(
-                    menu_handle[0], command_id, False, ctypes.byref(menu_item)
-                )
-                draw_menu_bar(self._menu_hwnd)
-            except Exception:
-                pass
-
-        def _begin_remote_probe(self) -> None:
-            with self._remote_probe_lock:
-                previous_cancel = self._remote_probe_cancel
-                self._remote_probe_id += 1
-                probe_id = self._remote_probe_id
-                cancel_event = threading.Event()
-                self._remote_probe_cancel = cancel_event
-                self._remote_menu_open = True
-
-            if previous_cancel:
-                previous_cancel.set()
-
-            mark_codex_remote_control_loading()
-            self.update_menu()
-
-            def _probe() -> None:
-                try:
-                    status = codex_remote_control_status(cancel_event)
-                except RemoteControlProbeCancelled:
-                    return
-
-                with self._remote_probe_lock:
-                    if (
-                        probe_id != self._remote_probe_id
-                        or not self._remote_menu_open
-                        or cancel_event.is_set()
-                    ):
-                        return
-
-                status = store_codex_remote_control_status(status)
-                self._update_open_remote_item(probe_id, status)
-
-            run_daemon_thread(_probe)
-
-        def _end_remote_probe(self) -> None:
-            with self._remote_probe_lock:
-                self._remote_menu_open = False
-                self._remote_probe_id += 1
-                cancel_event = self._remote_probe_cancel
-                self._remote_probe_cancel = None
-
-            if cancel_event:
-                cancel_event.set()
-
         def _show_context_menu(self) -> None:
-            self._begin_remote_probe()
+            self.update_menu()
             if not self._menu_handle:
-                self._end_remote_probe()
                 return
 
             pystray_win32.SetForegroundWindow(self._hwnd)
             point = wintypes.POINT()
             pystray_win32.GetCursorPos(ctypes.byref(point))
             hmenu, descriptors = self._menu_handle
-            try:
-                index = pystray_win32.TrackPopupMenuEx(
-                    hmenu,
-                    pystray_win32.TPM_RIGHTALIGN
-                    | pystray_win32.TPM_BOTTOMALIGN
-                    | pystray_win32.TPM_RETURNCMD,
-                    point.x,
-                    point.y,
-                    self._menu_hwnd,
-                    None,
-                )
-            finally:
-                self._end_remote_probe()
+            index = pystray_win32.TrackPopupMenuEx(
+                hmenu,
+                pystray_win32.TPM_RIGHTALIGN
+                | pystray_win32.TPM_BOTTOMALIGN
+                | pystray_win32.TPM_RETURNCMD,
+                point.x,
+                point.y,
+                self._menu_hwnd,
+                None,
+            )
 
             if index > 0:
                 descriptors[index - 1](self)
@@ -4236,94 +3275,6 @@ def run_server_with_tray(
     def on_bell(icon, item) -> None:
         trigger_test_alert()
 
-    def on_toggle_remote_control(icon, item) -> None:
-        status = cached_codex_remote_control_status()
-        if status.get("starting") or status.get("stopping"):
-            return
-
-        if status["running"]:
-            if not set_codex_remote_control_stopping():
-                return
-            icon.update_menu()
-
-            def _stop() -> None:
-                error = ""
-                try:
-                    stop_codex_remote_control()
-                    status = codex_remote_control_status()
-                except RuntimeError as exc:
-                    error = str(exc)
-                    status = {
-                        "available": bool(codex_cli_command()),
-                        "running": True,
-                        "pids": cached_codex_remote_control_status()["pids"],
-                        "error": error,
-                    }
-                store_codex_remote_control_status(status, finish_stopping=bool(error))
-                if error:
-                    try:
-                        icon.notify(safe_short(error, 180), CODEX_REMOTE_MENU_LABEL)
-                    except Exception:
-                        pass
-
-            run_daemon_thread(_stop)
-            return
-
-        def _notify_start_error(error: str) -> None:
-            try:
-                icon.notify(safe_short(error, 180), CODEX_REMOTE_MENU_LABEL)
-            except Exception:
-                pass
-
-        if not start_codex_remote_control_async(
-            check_running=False,
-            on_error=_notify_start_error,
-        ):
-            return
-        icon.update_menu()
-
-    def remote_control_text_value(status: dict) -> str:
-        if status.get("starting", False):
-            return f"{CODEX_REMOTE_MENU_LABEL} (Starting...)"
-        if status.get("stopping", False):
-            return f"{CODEX_REMOTE_MENU_LABEL} (Stopping...)"
-        if status.get("loading", False):
-            return f"{CODEX_REMOTE_MENU_LABEL} (Checking...)"
-        if status.get("error"):
-            return f"{CODEX_REMOTE_MENU_LABEL} (Check failed)"
-        if not status.get("available", False):
-            return f"{CODEX_REMOTE_MENU_LABEL} (CLI not found)"
-        return CODEX_REMOTE_MENU_LABEL
-
-    def remote_control_checked_value(status: dict) -> bool | None:
-        if (
-            status.get("starting", False)
-            or status.get("stopping", False)
-            or status.get("loading", False)
-            or status.get("error")
-            or not status.get("available", False)
-        ):
-            return None
-        return bool(status.get("running"))
-
-    def remote_control_enabled_value(status: dict) -> bool:
-        return (
-            not status.get("starting", False)
-            and not status.get("stopping", False)
-            and not status.get("loading", False)
-            and not status.get("error")
-            and status.get("available", False)
-        )
-
-    def remote_control_text(item) -> str:
-        return remote_control_text_value(cached_codex_remote_control_status())
-
-    def remote_control_checked(item) -> bool | None:
-        return remote_control_checked_value(cached_codex_remote_control_status())
-
-    def remote_control_enabled(item) -> bool:
-        return remote_control_enabled_value(cached_codex_remote_control_status())
-
     def on_toggle_startup(icon, item) -> None:
         try:
             if has_startup_task(startup_arguments):
@@ -4349,35 +3300,18 @@ def run_server_with_tray(
                 include_reset_countdown=True,
             )
         )
-        quota_keepalive_line = tray_quota_keepalive_status_line(
-            codex_quota_keepalive_service_status()
-        )
-        quota_keepalive_items = (
-            (pystray.MenuItem(quota_keepalive_line, None, enabled=False),)
-            if quota_keepalive_line
-            else ()
-        )
-        remote_item = pystray.MenuItem(
-            remote_control_text,
-            on_toggle_remote_control,
-            checked=remote_control_checked,
-            enabled=remote_control_enabled,
-        )
         items = (
             pystray.MenuItem("Open Dashboard", on_open_dashboard, default=True),
             pystray.Menu.SEPARATOR,
             *quota_items,
-            *quota_keepalive_items,
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Test Alert", on_bell),
-            remote_item,
             pystray.MenuItem(
                 "Start at Logon", on_toggle_startup, checked=startup_checked
             ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("Exit", on_exit),
         )
-        remote_menu_item_id["value"] = items.index(remote_item) + 1
         return items
 
     icon = DashboardTrayIcon(
@@ -4388,16 +3322,6 @@ def run_server_with_tray(
         tray_activate=on_open_dashboard,
         menu=pystray.Menu(build_tray_menu),
     )
-    if start_remote_control:
-
-        def _notify_auto_start_error(error: str) -> None:
-            try:
-                icon.notify(safe_short(error, 180), CODEX_REMOTE_MENU_LABEL)
-            except Exception:
-                pass
-
-        start_codex_remote_control_async(on_error=_notify_auto_start_error)
-
     attention_stop = threading.Event()
     attention_thread = threading.Thread(
         target=run_tray_attention_loop,
@@ -4414,8 +3338,6 @@ def run_server_with_tray(
         attention_thread.join(timeout=2)
         if quota_poller:
             quota_poller.stop()
-        if quota_keepalive_monitor:
-            quota_keepalive_monitor.stop()
         server.shutdown()
         if exit_requested.is_set():
             os._exit(0)
@@ -4451,22 +3373,7 @@ def main() -> int:
         action="store_true",
         help="show a Windows notification-area icon while serving",
     )
-    parser.add_argument(
-        "--start-remote-control",
-        action="store_true",
-        help="start codex remote-control in the background when the dashboard starts",
-    )
-    parser.add_argument(
-        "--codex-quota-keepalive-url",
-        help=(
-            "monitor a Codex quota keepalive service at this URL "
-            f"(overrides {QUOTA_KEEPALIVE_SERVICE_URL_ENV})"
-        ),
-    )
     args = parser.parse_args()
-
-    if args.codex_quota_keepalive_url is not None:
-        os.environ[QUOTA_KEEPALIVE_SERVICE_URL_ENV] = args.codex_quota_keepalive_url
 
     if args.install_startup:
         install_startup(command_arguments)
@@ -4485,11 +3392,10 @@ def main() -> int:
     if args.tray:
         return run_server_with_tray(
             args.open_browser,
-            args.start_remote_control,
             startup_arguments=command_arguments,
         )
 
-    return run_server_blocking(args.open_browser, args.start_remote_control)
+    return run_server_blocking(args.open_browser)
 
 
 if __name__ == "__main__":
