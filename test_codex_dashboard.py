@@ -47,6 +47,40 @@ class InterruptTests(unittest.TestCase):
         self.assertEqual(item["status"], "interrupted")
 
 
+class UserInputTests(unittest.TestCase):
+    def setUp(self):
+        self.client = dashboard.app.test_client()
+        self.payload = {"session_id": "question-test", "turn_id": "turn", "tool_use_id": "question-1",
+                        "tool_name": "request_user_input", "tool_input": {"questions": [{"question": "Which?", "options": [{"label": "A"}]}]}}
+
+    def tearDown(self):
+        dashboard.CONVERSATIONS.pop("question-test", None)
+
+    def test_question_alert_and_answer_lifecycle(self):
+        with patch.object(dashboard, "notify_attention_async") as notify:
+            self.client.post("/api/codex/request_user_input", json=self.payload)
+        notify.assert_called_once()
+        row = dashboard.CONVERSATIONS["question-test"]
+        self.assertEqual(dashboard.stored_to_item(row)["status"], "input")
+        self.assertIn("Which?", row["permission"]["command"])
+        with dashboard.STORE_LOCK:
+            self.assertEqual(dashboard.current_attention_unlocked()["label"], "Needs Input")
+        with patch.object(dashboard, "stop_dashboard_taskbar_flash_if_idle_async"):
+            self.client.post("/api/codex/user_input_answered", json=self.payload)
+        self.assertEqual(row["status"], "thinking")
+        self.assertIsNone(row["permission"])
+
+    def test_stale_question_and_answer_are_ignored(self):
+        self.client.post("/api/codex/user_prompt_submit", json=self.payload)
+        stale = dict(self.payload, turn_id="old")
+        self.assertTrue(self.client.post("/api/codex/request_user_input", json=stale).get_json()["ignored"])
+        with patch.object(dashboard, "notify_attention_async"):
+            self.client.post("/api/codex/request_user_input", json=self.payload)
+        wrong_call = dict(self.payload, tool_use_id="question-0")
+        self.assertTrue(self.client.post("/api/codex/user_input_answered", json=wrong_call).get_json()["ignored"])
+        self.assertIsNotNone(dashboard.CONVERSATIONS["question-test"]["permission"])
+
+
 class QuotaDashboardTests(unittest.TestCase):
     def setUp(self):
         with dashboard.STORE_LOCK:

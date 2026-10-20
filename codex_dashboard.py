@@ -779,6 +779,8 @@ def current_attention_unlocked() -> dict:
         alerts = permission_alerts
         alert = permission_alerts[0]
         kind, title, label = "permission", "Permission Needed", "Needs Permission"
+        if alert.get("kind") == "input":
+            title, label = "Input Needed", "Needs Input"
         description = (
             alert.get("description")
             or alert.get("command")
@@ -1882,7 +1884,7 @@ def conversation_key(item: dict) -> str:
 def stored_to_item(row: dict) -> dict:
     return {
         "session_id": row.get("session_id", ""),
-        "status": row.get("status", ""),
+        "status": "input" if (row.get("permission") or {}).get("kind") == "input" and row.get("status") == "permission" else row.get("status", ""),
         "current_turn_id": row.get("current_turn_id", ""),
         "machine": row.get("machine") or "",
         "cwd": row.get("cwd") or "",
@@ -2205,10 +2207,16 @@ def interrupt():
     return jsonify({"ok": True})
 
 
+@app.post("/api/codex/request_user_input")
 @app.post("/api/codex/permission_request")
 def permission_request():
     payload = request.get_json(force=True, silent=True) or {}
     alert = permission_summary(payload)
+    if request.path.endswith("/request_user_input"):
+        alert["kind"] = "input"
+        alert["description"] = "Codex is waiting for your answer"
+        alert["command"] = safe_json_short(payload.get("tool_input") or {}, 2000)
+        alert["tool_use_id"] = payload.get("tool_use_id") or ""
 
     with STORE_LOCK:
         session_id = alert["session_id"]
@@ -2255,6 +2263,22 @@ def permission_request():
             }
 
     notify_attention_async()
+    return jsonify({"ok": True})
+
+
+@app.post("/api/codex/user_input_answered")
+def user_input_answered():
+    payload = request.get_json(force=True, silent=True) or {}
+    with STORE_LOCK:
+        row = CONVERSATIONS.get(payload.get("session_id") or "unknown-session")
+        alert = row.get("permission") if row else None
+        if (not row or row.get("status") != "permission"
+                or not isinstance(alert, dict) or alert.get("kind") != "input"
+                or not is_current_turn(row, payload.get("turn_id") or "")
+                or (alert.get("tool_use_id") and alert["tool_use_id"] != payload.get("tool_use_id"))):
+            return jsonify({"ok": True, "ignored": True})
+        row.update(status="thinking", permission=None, updated_at=now_ts())
+    stop_dashboard_taskbar_flash_if_idle_async()
     return jsonify({"ok": True})
 
 
@@ -2367,7 +2391,7 @@ def index():
       border-color: #f59e0b;
       box-shadow: 0 0 0 1px rgba(245,158,11,0.25), 0 8px 24px rgba(0,0,0,0.25);
     }
-    .card.permission {
+    .card.permission, .card.input {
       border-color: #ef4444;
       box-shadow: 0 0 0 1px rgba(239,68,68,0.28), 0 8px 24px rgba(0,0,0,0.25);
     }
@@ -2396,7 +2420,7 @@ def index():
       background: rgba(245,158,11,0.15);
       color: #fbbf24;
     }
-    .badge.permission {
+    .badge.permission, .badge.input {
       background: rgba(239,68,68,0.16);
       color: #fca5a5;
     }
@@ -2590,7 +2614,7 @@ async function load() {
     const prompt = item.prompt || '';
     const answer = item.last_assistant_message || '';
     const sessionCount = item.session_count || 1;
-    const statusText = status === 'thinking' ? 'Thinking' : status === 'permission' ? 'Needs Permission' : status === 'interrupted' ? 'Interrupted' : 'Done';
+    const statusText = status === 'thinking' ? 'Thinking' : status === 'permission' ? 'Needs Permission' : status === 'input' ? 'Needs Input' : status === 'interrupted' ? 'Interrupted' : 'Done';
     const openAttrs = openTargetAttrs(item);
     const quota = quotaSummary(item.quota);
 
@@ -2759,7 +2783,7 @@ function renderAlert(item) {
   return `
     <div class="alert">
       <div class="row">
-        <span class="badge permission">Needs Permission</span>
+        <span class="badge permission">${item.kind === 'input' ? 'Needs Input' : 'Needs Permission'}</span>
         <span class="alert-title">${escapeHtml(title)}</span>
         <span class="muted">${escapeHtml(item.created_at || '')}</span>
       </div>

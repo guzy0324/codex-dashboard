@@ -332,3 +332,37 @@ ss -ltnp | grep :18765
 ## 许可证
 
 本项目使用 MIT License。详见 [LICENSE](LICENSE)。
+
+## 选择题提醒 / User input alerts
+
+选择题可复用本地声音、托盘和顶部提醒，显示 `Needs Input`。回答后恢复
+`Thinking`；停止、中断或新回合也会清除提醒。面板只提醒，不代替用户回答。
+
+将以下配置加入 Codex `config.toml`，调整 Python、helper 的绝对路径和机器名。
+Windows 可用 `python`，Linux/macOS 可改用 `python3`。helper 路径含空格时需按
+运行 hook 的 shell 规则加引号。已有 hooks 配置时合并 `[features]`，避免重复表。
+
+```toml
+[features]
+hooks = true
+
+[[hooks.PreToolUse]]
+matcher = "^request_user_input(_async)?$"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "python /absolute/path/dashboard_hook.py request_user_input gpu01"
+timeout = 3
+
+[[hooks.PostToolUse]]
+matcher = "^request_user_input$"
+
+[[hooks.PostToolUse.hooks]]
+type = "command"
+command = "python /absolute/path/dashboard_hook.py user_input_answered gpu01"
+timeout = 3
+```
+
+`dashboard_hook.json` 的 `commands.request_user_input` 可配置选择题出现时的额外
+通知；`commands.user_input_answered` 在回答后执行。修改后重启 Codex 并信任更新的
+hook。此功能依赖所用 Codex 版本对 `request_user_input` 的工具 hook 支持。
